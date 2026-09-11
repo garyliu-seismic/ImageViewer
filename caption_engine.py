@@ -224,12 +224,12 @@ class LiveCaptioner:
                     pass
 
     def stop(self):
-        # 通知 AI 翻译线程退出（daemon 线程，不阻塞退出）
-        if self._ai_queue is not None:
-            try:
-                self._ai_queue.put(None)
-            except Exception:
-                pass
+        # 不在这里杀 _ai_worker 线程：它是 daemon 线程，空闲时阻塞在
+        # queue.get() 上，不影响进程退出；同一个 LiveCaptioner 实例后续
+        # 若被重新 start_async()（比如同一视频/语言下字幕关了又开），
+        # self._model 已经非 None 会跳过 _load_model()，_ai_queue/_ai_thread
+        # 也就不会被重建 -- 之前在这里把线程杀掉会导致重启后 AI 翻译永久失效
+        # （_emit_final 只判断 _ai_queue is not None，队列还在但没有消费者）。
         # 不主动调 audio_set_callbacks(None, ...) 去解绑 -- 实测这样做之后紧
         # 跟着的 player.stop() 会在 libvlc 内部崩掉（access violation），大概
         # 是把 libvlc 的音频输出内部状态搞乱了。改成什么都不做，让调用方随后
