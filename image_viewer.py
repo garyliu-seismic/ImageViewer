@@ -43,6 +43,7 @@ import hashlib
 import zipfile
 import tempfile
 import shutil
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -150,6 +151,7 @@ class ComicViewer(tk.Tk):
         self.vlc_instance = None
         self.player = None
         self._video_timer = None
+        self._stop_event = None  # 后台线程 stop() 的完成信号（见 _stop_player）
         self._video_ended = False
         self._last_seek = 0.0
         self._updating_seek = False
@@ -157,6 +159,7 @@ class ComicViewer(tk.Tk):
         self._tmp_dir = tempfile.mkdtemp(prefix="image_viewer_")
 
         self.caption_enabled = False
+        self.caption_pos = self._config.get("_ui_", {}).get("caption_pos", "bottom")  # "bottom" | "top"
         self._captioner = None
         self._caption_poll_after = None
         self._caption_await_after = None
@@ -252,6 +255,10 @@ class ComicViewer(tk.Tk):
                                                values=CAPTION_MODES, state="readonly", width=9)
         self.caption_mode_combo.pack(side="left", padx=2)
         self.caption_mode_combo.bind("<<ComboboxSelected>>", self._on_caption_mode_change)
+        self.caption_pos_btn = self._state_btn(
+            self.video_bar,
+            "字幕位置: " + ("顶部" if self.caption_pos == "top" else "底部"),
+            self.toggle_caption_pos)
 
         # VLC 硬件加速（D3D11）在 video_panel 的原生窗口上直接画视频画面，会盖住
         # 任何叠在它上面的 Tk 子控件 -- Tk 的 lift()/z-order 对这种系统合成层面
@@ -321,7 +328,10 @@ class ComicViewer(tk.Tk):
         cw = self.caption_label.winfo_reqwidth()
         ch = self.caption_label.winfo_reqheight()
         cx = x + max(0, (w - cw) // 2)
-        cy = y + int(h * 0.94) - ch
+        if self.caption_pos == "top":
+            cy = y + int(h * 0.06)
+        else:
+            cy = y + int(h * 0.94) - ch
         self.caption_window.geometry("+%d+%d" % (cx, cy))
 
     def _raise_caption_window(self):
@@ -599,14 +609,14 @@ class ComicViewer(tk.Tk):
             # 关掉硬件加速解码（D3D11）：这台机器上开字幕时 stop() 会在 libvlc
             # 内部卡死不返回，日志里能看到 D3D11 vout 本身也报过错
             # ("SetThumbNailClip failed")，怀疑是这张 GPU/驱动跟 VLC 的硬件
-            # 加速视频输出路径收尾时的同步有问题，跟音频回调无关。软解可以
-            # 绕开。
-            # 视频输出也用 direct3d9 而不是默认的 direct3d11：D3D11 vout 走
-            # flip-model 合成层直接上屏，会盖住叠在它上面的独立字幕窗口（全屏
-            # 时尤其明显）；D3D9 渲染进窗口自身表面、尊重 z-order，字幕窗口才能
-            # 一直保持在视频之上。
+            # 加速视频输出路径收尾时的同步有问题，跟音频回调无关。
+            # 视频输出改用 wingdi（GDI 软件渲染）而不是 direct3d11/direct3d9：
+            # 这台机器的 GPU 驱动在 D3D vout 的 stop 收尾时会死锁（复现：播放中
+            # 打开另一个视频，卡死在 libvlc_media_player_stop）。GDI 纯 CPU 渲染
+            # 不经过 GPU 驱动，绕开这个死锁；代价是高清视频软渲染更吃 CPU，但
+            # 漫画里的短视频通常够用。
             self.vlc_instance = vlc.Instance([
-                "--avcodec-hw=none", "--vout=direct3d9",
+                "--avcodec-hw=none", "--vout=wingdi",
                 # 不接管鼠标/键盘事件：让滚轮 / 触控板手势 / 快捷键传到 Tk
                 # （否则 VLC 会把 F=全屏、空格=暂停、回车=导航、滚轮=音量 都自己吃掉）
                 "--no-mouse-events", "--no-keyboard-events",
@@ -651,8 +661,10 @@ class ComicViewer(tk.Tk):
         self._video_ended = False
         self._show_video_panel()
         try:
-            self.player.stop()
-            media = self.vlc_instance.media_new(path)
+            # 关掉 D3D11VA 硬件解码：必须作为 media 选项传才生效（Instance 上的
+            # --avcodec-hw=none 在 VLC 3.0.20 里不生效；而且 set_hwnd() 会把
+            # avcodec-hw 重置为空）。否则切视频时解码器收尾会死锁。
+            media = self.vlc_instance.media_new(path, ":avcodec-hw=none")
             self.player.set_media(media)
             self.player.set_hwnd(self.video_panel.winfo_id())
             # 字幕的 audio_set_format/audio_set_callbacks 必须在 play() 之前设置，
@@ -685,14 +697,59 @@ class ComicViewer(tk.Tk):
         if self._video_timer:
             self.after_cancel(self._video_timer)
             self._video_timer = None
+        # 先置位：_stop_player 会 pump Tk 事件，期间若有残留的 after 回调
+        # （如 _refresh_video_hwnd / _update_video_time_loop）会因 is_video=False
+        # 而直接返回，避免在后台 stop 进行中误触 player。
+        self.is_video = False
         self._stop_captions()
-        if self.player:
+        self._stop_player()
+        self._hide_video_bar()
+
+    def _stop_player(self, player=None):
+        """安全地停掉 VLC 播放器，避免卡死 Tk 主线程。
+
+        libvlc 的 stop() 是同步的；当视频通过 set_hwnd() 嵌入到 Tk 窗口时，若在
+        Tk 主线程里直接调用，会死锁：stop() 内部 vout_Close 会 vlc_join 等 vout
+        线程退出，而 vout 线程又在等主线程处理窗口消息（主线程此刻阻塞在 stop()
+        里，永远没机会处理）。
+
+        解法：把 stop() 放到后台线程，主线程在这期间持续 pump Tk 事件，让 vout
+        线程能正常收尾。加超时只是兜底，正常情况下 <1s 就会返回。
+        """
+        player = player or self.player
+        if player is None:
+            return
+        # 已有 stop 在后台进行中：直接等它完成，避免并发 stop。
+        if self._stop_event is not None and not self._stop_event.is_set():
+            self._wait_stop()
+            return
+        self._stop_event = threading.Event()
+
+        def _do_stop():
             try:
-                self.player.stop()
+                player.stop()
             except Exception:
                 pass
-        self.is_video = False
-        self._hide_video_bar()
+            finally:
+                self._stop_event.set()
+
+        threading.Thread(target=_do_stop, daemon=True).start()
+        self._wait_stop()
+
+    def _wait_stop(self):
+        deadline = time.time() + 8.0
+        while not self._stop_event.is_set() and time.time() < deadline:
+            try:
+                self.update()
+            except Exception:
+                pass
+            time.sleep(0.01)
+
+    def _video_is_stopping(self):
+        """后台是否正在执行 player.stop()。此时不能碰 player 的其它 libvlc
+        接口（如 get_length/get_time/pause），否则会跟 stop() 抢 libvlc 内部锁，
+        把主线程卡死在 get_length() 等调用里（实测复现）。"""
+        return self._stop_event is not None and not self._stop_event.is_set()
 
     def _show_video_bar(self):
         if not self.video_bar.winfo_manager():
@@ -715,7 +772,7 @@ class ComicViewer(tk.Tk):
             self.update_idletasks()
 
     def _toggle_play(self):
-        if not self.player or not self.is_video:
+        if not self.player or not self.is_video or self._video_is_stopping():
             return
         try:
             if self.player.is_playing():
@@ -731,7 +788,7 @@ class ComicViewer(tk.Tk):
         if self._updating_seek:
             return
         self._last_seek = time.time()
-        if not self.player or not self.is_video:
+        if not self.player or not self.is_video or self._video_is_stopping():
             return
         try:
             length = self.player.get_length()
@@ -743,7 +800,7 @@ class ComicViewer(tk.Tk):
             pass
 
     def _on_volume(self, val):
-        if self.player:
+        if self.player and not self._video_is_stopping():
             try:
                 self.player.audio_set_volume(int(float(val)))
             except Exception:
@@ -751,7 +808,7 @@ class ComicViewer(tk.Tk):
 
     def _update_video_time_loop(self):
         self._video_timer = None
-        if not self.is_video or not self.player:
+        if not self.is_video or not self.player or self._video_is_stopping():
             return
         try:
             length = self.player.get_length()
@@ -782,7 +839,17 @@ class ComicViewer(tk.Tk):
             if self.caption_enabled:
                 self._start_captions()
             else:
-                self._stop_captions()
+                # 关闭字幕时保留声音：进入透传模式（只停识别，不停输出流）
+                self._stop_captions(keep_audio=True)
+
+    def toggle_caption_pos(self):
+        self.caption_pos = "top" if self.caption_pos != "top" else "bottom"
+        self.caption_pos_btn.configure(
+            text="字幕位置: " + ("顶部" if self.caption_pos == "top" else "底部"))
+        self._config.setdefault("_ui_", {})["caption_pos"] = self.caption_pos
+        self._save_config()
+        if self.is_video:
+            self._reposition_caption_window()
 
     def _on_caption_lang_change(self, event=None):
         if self.caption_lang_var.get() == "中文":
@@ -814,7 +881,7 @@ class ComicViewer(tk.Tk):
         self.caption_label.configure(text="字幕模型加载中…")
         self.caption_window.deiconify()
         self._reposition_caption_window()
-        self._captioner.start_async(self.player)
+        self._captioner.start_async(self.player, stop_fn=self._stop_player)
         if self._caption_await_after:
             self.after_cancel(self._caption_await_after)
         self._caption_await_after = self.after(150, self._await_caption_start)
@@ -834,11 +901,36 @@ class ComicViewer(tk.Tk):
             self._sync_toggle_buttons()
             self.caption_window.withdraw()
             return
+        # 若回调是在播放中设置的（播放中开字幕，或首次异步加载模型导致
+        # play 先于 audio_set_callbacks），_finish_start 已先 stop，这里
+        # play 并 seek 回原进度，让 libvlc 真正把音频交给回调接管。
+        if getattr(self._captioner, "_needs_play", False):
+            self._resume_video_after_captions()
         self.caption_label.configure(text="")
         self._reposition_caption_window()
         self._poll_captions()
 
-    def _stop_captions(self):
+    def _resume_video_after_captions(self):
+        """字幕回调就绪后恢复播放。_finish_start 已在设置回调前 stop 掉播放
+        （那是安全时机），这里 play 并 seek 回原进度即可。"""
+        if not self.player or not self.is_video:
+            return
+        try:
+            self.player.play()
+            cur = getattr(self._captioner, "_resume_time", 0)
+            if cur > 0:
+                self.player.set_time(cur)
+            self.player.audio_set_volume(int(self.vol.get()))
+        except Exception:
+            pass
+        # stop 期间时间刷新循环被暂停了（_video_is_stopping 让其提前返回且不重排），
+        # 恢复播放后重新拉起它，否则进度条/时间标签不再更新。
+        if self._video_timer:
+            self.after_cancel(self._video_timer)
+            self._video_timer = None
+        self._update_video_time_loop()
+
+    def _stop_captions(self, keep_audio=False):
         if self._caption_await_after:
             self.after_cancel(self._caption_await_after)
             self._caption_await_after = None
@@ -846,7 +938,7 @@ class ComicViewer(tk.Tk):
             self.after_cancel(self._caption_poll_after)
             self._caption_poll_after = None
         if self._captioner is not None:
-            self._captioner.stop()
+            self._captioner.stop(keep_audio=keep_audio)
         self.caption_window.withdraw()
 
     def _open_ai_settings(self):
@@ -1193,7 +1285,8 @@ class ComicViewer(tk.Tk):
             self.after(300, self._raise_caption_window)
 
     def _refresh_video_hwnd(self):
-        if self.is_video and self.player and self.video_panel.winfo_manager():
+        if (self.is_video and self.player and not self._video_is_stopping()
+                and self.video_panel.winfo_manager()):
             try:
                 self.player.set_hwnd(self.video_panel.winfo_id())
             except Exception:

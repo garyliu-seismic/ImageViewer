@@ -113,6 +113,11 @@ class LiveCaptioner:
         self._trans_thread = None
         self._pcm_queue = None
         self._rec_thread = None
+        self._needs_play = False
+        self._resume_time = 0
+        self._stop_fn = None
+        self._empty_play_cb = None
+        self._empty_flush_cb = None
         # VLC 的音频回调在它自己的线程上跑；stop() 在 UI 线程上跑。不加锁的话
         # stop() 可能在回调线程还在写 _out_stream 的时候把它关掉，PortAudio 流
         # 被并发 close()+write() 会卡死，进而把 player.stop() 也一起拖死（复现
@@ -141,9 +146,15 @@ class LiveCaptioner:
                 self._translator = None  # ai_translate 模式下 Argos 只作兜底，缺失可继续
         return self._model
 
-    def start_async(self, player):
+    def start_async(self, player, stop_fn=None):
         """Non-blocking. Call poll() from the caller's own thread (the one
-        that owns `player`) to find out when it's done."""
+        that owns `player`) to find out when it's done.
+
+        `stop_fn(player)`（可选）用于在绑定音频回调前停掉正在播放的 player，
+        替代同步的 player.stop()。调用方把视频嵌入到窗口（set_hwnd）时，同步
+        stop() 会死锁，应传入一个能安全停 player 的实现（如后台线程 stop + pump）。
+        """
+        self._stop_fn = stop_fn
         if self._player is not None:
             self._start_result = (True, None)
             return
@@ -194,13 +205,12 @@ class LiveCaptioner:
             import vosk
             import sounddevice as sd
 
+            # 若上次是透传关闭（stop(keep_audio=True)）残留了输出流，先关掉，
+            # 避免重新开字幕时开出第二个 sounddevice 流。
+            self._close_stream()
+
             recognizer = vosk.KaldiRecognizer(self._model, SAMPLE_RATE)
             recognizer.SetWords(False)
-
-            out_stream = sd.RawOutputStream(
-                samplerate=SAMPLE_RATE, channels=1, dtype="int16",
-                blocksize=OUT_BLOCKSIZE, latency="low")
-            out_stream.start()
 
             play_cb = vlc.CallbackDecorators.AudioPlayCb(self._on_audio_play)
             flush_cb = vlc.CallbackDecorators.AudioFlushCb(self._on_audio_flush)
@@ -208,7 +218,6 @@ class LiveCaptioner:
             _CALLBACK_KEEPALIVE.append(flush_cb)
 
             self._recognizer = recognizer
-            self._out_stream = out_stream
             self._play_cb = play_cb
             self._flush_cb = flush_cb
 
@@ -224,11 +233,31 @@ class LiveCaptioner:
                 self._trans_thread = threading.Thread(target=self._trans_worker, daemon=True)
                 self._trans_thread.start()
 
+            # libvlc 的 audio_set_callbacks 必须在 play() 之前设置才保证接管。
+            # 若视频已在播放，必须在设置回调前先 stop -- 此刻新回调还没绑、新流
+            # 还没开（上面的 _close_stream 已把旧流关掉），stop 是安全的；之后由
+            # 调用方 play() 恢复播放，回调才会真正接管音频。
+            self._needs_play = bool(player.is_playing())
+            if self._needs_play:
+                self._resume_time = player.get_time()
+                if self._stop_fn is not None:
+                    self._stop_fn(player)
+                else:
+                    player.stop()
+
             player.audio_set_format(b"S16N", SAMPLE_RATE, 1)
             # flush 是 VLC 自己在 seek/stop 时丢弃缓冲区的信号 -- 用它来清空识别器
             # 上下文，比在 UI 线程的 seek 事件里手动调 reset() 更准，能避免 UI 侧
             # 时机跟 VLC 内部丢弃缓冲区的时机没对齐、导致跳转后残留一两个旧词的问题。
             player.audio_set_callbacks(play_cb, None, None, flush_cb, None, None)
+
+            # 开流：必须在 play() 之前开好，这样回调一被调用就能立即写。
+            out_stream = sd.RawOutputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                blocksize=OUT_BLOCKSIZE, latency="low")
+            out_stream.start()
+            self._out_stream = out_stream
+
             self._player = player
             self.error = None
             self._start_result = (True, None)
@@ -259,7 +288,30 @@ class LiveCaptioner:
         except queue.Full:
             pass
 
-    def stop(self):
+    def _close_stream(self):
+        """关闭 sounddevice 输出流（加锁，等当前回调写完）。拆流后若 VLC 回调
+        仍被调用，_on_audio_play 会因 _out_stream 为 None 而静默丢帧。"""
+        with self._callback_lock:
+            if self._out_stream is not None:
+                try:
+                    # .stop() waits for buffered audio to drain before
+                    # returning; on this sounddevice/PortAudio build that
+                    # wait reliably hung for 10s+ and then crashed the
+                    # process with an access violation. .abort() discards
+                    # the buffer and returns immediately instead -- fine
+                    # here since we're tearing the stream down anyway.
+                    self._out_stream.abort()
+                    self._out_stream.close()
+                except Exception:
+                    pass
+                self._out_stream = None
+
+    def stop(self, keep_audio=False):
+        """keep_audio=True：只停识别/字幕，保留声音输出（透传模式），供
+        「关闭字幕」按钮使用 -- VLC 音频回调仍绑着，我们继续用 _out_stream
+        出声，避免「解绑回调会崩溃 / 拆流又完全无声」的两难。代价是音质仍
+        停在 16kHz 单声道，直到切视频或 keep_audio=False 彻底拆流才恢复。"""
+        player = self._player  # 先拿引用，拆流后要用它换空回调解绑
         # 通知翻译线程退出并清空引用（_finish_start 会在下次启动时重建它）。
         trans_queue = self._trans_queue
         trans_thread = self._trans_thread
@@ -291,28 +343,45 @@ class LiveCaptioner:
         # 也不清空 _play_cb/_flush_cb（万一 libvlc 内部还留着指向它们的指针，
         # 提前被 Python 回收就是野指针）。
         self._player = None
-        # 等任何正在执行的回调写完，再拆 _out_stream -- 见 __init__ 里
-        # _callback_lock 的注释。
-        with self._callback_lock:
-            if self._out_stream is not None:
-                try:
-                    # .stop() waits for buffered audio to drain before
-                    # returning; on this sounddevice/PortAudio build that
-                    # wait reliably hung for 10s+ and then crashed the
-                    # process with an access violation. .abort() discards
-                    # the buffer and returns immediately instead -- fine
-                    # here since we're tearing the stream down anyway.
-                    self._out_stream.abort()
-                    self._out_stream.close()
-                except Exception:
-                    pass
-                self._out_stream = None
-            self._recognizer = None
+        if not keep_audio:
+            # 彻底拆流（切视频 / 换语言 / 换模式时用）。
+            self._close_stream()
+            # 换成空回调解绑：若什么都不做，回调仍绑着，随后调用方的
+            # player.stop() 会在 libvlc 内部死锁（复现：切视频卡死在
+            # libvlc_media_player_stop）；若解绑成 None，又会 access
+            # violation。空回调立即返回，让音频输出线程正常收尾，stop
+            # 既不卡也不崩。
+            if player is not None:
+                self._unbind_callbacks(player)
+        # _rec_worker 已 join 退出，此刻无人再碰 _recognizer，可安全置空。
+        self._recognizer = None
         while True:
             try:
                 self.queue.get_nowait()
             except queue.Empty:
                 break
+
+    def _unbind_callbacks(self, player):
+        """把真实音频回调换成「立即返回」的空回调，让 libvlc 的音频输出线程
+        能正常收尾，从而 player.stop() 不死锁；又因为回调指针始终有效（非
+        None），不会触发解绑成 None 时的 access violation。"""
+        try:
+            import vlc
+            if self._empty_play_cb is None:
+                self._empty_play_cb = vlc.CallbackDecorators.AudioPlayCb(self._on_dummy_play)
+                self._empty_flush_cb = vlc.CallbackDecorators.AudioFlushCb(self._on_dummy_flush)
+                _CALLBACK_KEEPALIVE.append(self._empty_play_cb)
+                _CALLBACK_KEEPALIVE.append(self._empty_flush_cb)
+            player.audio_set_callbacks(self._empty_play_cb, None, None,
+                                       self._empty_flush_cb, None, None)
+        except Exception:
+            pass
+
+    def _on_dummy_play(self, data, samples, count, pts):
+        pass
+
+    def _on_dummy_flush(self, data, pts):
+        pass
 
     def _on_audio_flush(self, data, pts):
         self.reset()
