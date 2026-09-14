@@ -38,6 +38,7 @@ import re
 import math
 import time
 import json
+import random
 import queue
 import hashlib
 import zipfile
@@ -173,6 +174,14 @@ class ComicViewer(tk.Tk):
         self._video_ended = False
         self._last_seek = 0.0
         self._updating_seek = False
+        self._resume_seek_ms = None
+        self._ab_start_ms = None
+        self._ab_end_ms = None
+        video_cfg = self._config.get("_video_", {})
+        self._repeat_one = bool(video_cfg.get("repeat_one", False))
+        self._repeat_playlist = bool(video_cfg.get("repeat_playlist", False))
+        self._shuffle_playlist = bool(video_cfg.get("shuffle_playlist", False))
+        self._video_zoom = clamp(float(video_cfg.get("zoom", 1.0)), 0.5, 4.0)
         self._video_cache = {}
         self._tmp_dir = tempfile.mkdtemp(prefix="image_viewer_")
 
@@ -227,10 +236,10 @@ class ComicViewer(tk.Tk):
         self.page_label.pack(side="left", padx=4)
         self._btn(self.toolbar, "⏭", self.next, tip="下一页")
         self._sep(self.toolbar)
-        self.zoom_out_btn = self._btn(self.toolbar, "➖", lambda: self.zoom_center(0.8), tip="缩小")
+        self.zoom_out_btn = self._btn(self.toolbar, "➖", self.zoom_out, tip="缩小")
         self.zoom_label = tk.Label(self.toolbar, text="100%", bg=PANEL, fg=MUTED, width=6)
         self.zoom_label.pack(side="left", padx=4)
-        self.zoom_in_btn = self._btn(self.toolbar, "➕", lambda: self.zoom_center(1.25), tip="放大")
+        self.zoom_in_btn = self._btn(self.toolbar, "➕", self.zoom_in, tip="放大")
         self._sep(self.toolbar)
         self._btn(self.toolbar, "⛶ 全屏", self.toggle_fullscreen, tip="全屏 (回车 / F / F11)")
         self._btn(self.toolbar, "? 帮助", self.show_help, tip="帮助")
@@ -288,6 +297,16 @@ class ComicViewer(tk.Tk):
         self.rate_label.pack(side="left", padx=(6, 6))
         self.rate_plus_btn = self._state_btn(self.video_bar, "快", lambda: self.rate_change(1))
         self.rate_btn = self._state_btn(self.video_bar, "变速", self._choose_rate)
+        self.video_zoom_out_btn = self._state_btn(self.video_bar, "画面-", lambda: self.change_video_zoom(-0.25))
+        self.video_zoom_label = tk.Label(self.video_bar, text="画面 100%", bg=PANEL, fg=FG,
+                         font=("Consolas", 10))
+        self.video_zoom_label.pack(side="left", padx=(4, 4))
+        self.video_zoom_in_btn = self._state_btn(self.video_bar, "画面+", lambda: self.change_video_zoom(0.25))
+        self.video_zoom_reset_btn = self._state_btn(self.video_bar, "重置画面", self.reset_video_zoom)
+        self.ab_btn = self._state_btn(self.video_bar, "A-B", self.toggle_ab_repeat)
+        self.repeat_one_btn = self._state_btn(self.video_bar, "单曲循环", self.toggle_repeat_one)
+        self.repeat_list_btn = self._state_btn(self.video_bar, "列表循环", self.toggle_repeat_playlist)
+        self.shuffle_btn = self._state_btn(self.video_bar, "随机", self.toggle_shuffle_playlist)
 
         self.caption_btn = self._state_btn(self.video_bar, "CC 字幕", self.toggle_captions)
         self.caption_lang_var = tk.StringVar(value="英文")
@@ -357,6 +376,10 @@ class ComicViewer(tk.Tk):
         view.add_command(label="外挂字幕 (.srt/.ass)", command=self._choose_subtitle, accelerator="S")
         view.add_command(label="播放速率 +1 档", command=lambda: self.rate_change(1))
         view.add_command(label="播放速率 -1 档", command=lambda: self.rate_change(-1))
+        view.add_command(label="A-B 循环 开始/结束/清除", command=self.toggle_ab_repeat)
+        view.add_command(label="单曲循环", command=self.toggle_repeat_one)
+        view.add_command(label="播放列表循环", command=self.toggle_repeat_playlist)
+        view.add_command(label="播放列表随机", command=self.toggle_shuffle_playlist)
         view.add_command(label="下一轨（播放列表）", command=self._playlist_forward)
         view.add_command(label="上一轨（播放列表）", command=self._playlist_back)
         view.add_command(label="图片对比模式（两图并排）", command=self.toggle_compare)
@@ -797,6 +820,9 @@ class ComicViewer(tk.Tk):
             self._cancel_auto()
             self._sync_toggle_buttons()
         self._video_ended = False
+        self._ab_start_ms = None
+        self._ab_end_ms = None
+        self._resume_seek_ms = self._get_resume_position(src)
         # 打开新视频时按文件名自动加载外接字幕；速率在用户调整后持久化
         self._load_subtitle_for(self.sources[self.index])
         self._apply_rate_now()
@@ -821,6 +847,7 @@ class ComicViewer(tk.Tk):
             self._apply_rate_now()
             self.player.audio_set_volume(int(self.vol.get()))
             self.is_video = True
+            self._apply_video_zoom()
             self.play_btn.configure(text="⏸")
             # VLC 的原生视频窗口会抢走键盘/滚轮焦点，导致快捷键和触控板手势失效；
             # 等它播放起来后把焦点拉回 Tk 主窗口，事件才会走我们的分发。
@@ -839,6 +866,112 @@ class ComicViewer(tk.Tk):
             self.focus_force()
         except Exception:
             pass
+
+    def _video_resume_key(self, src):
+        if isinstance(src, tuple):
+            return None
+        return os.path.normcase(os.path.abspath(src))
+
+    def _get_resume_position(self, src):
+        key = self._video_resume_key(src)
+        if not key:
+            return None
+        position = self._config.get("_video_resume_", {}).get(key)
+        return int(position) if isinstance(position, (int, float)) and position > 0 else None
+
+    def _save_resume_position(self):
+        if not self.is_video or not self.player or self._video_is_stopping():
+            return
+        key = self._video_resume_key(self.sources[self.index])
+        if not key:
+            return
+        try:
+            position = self.player.get_time()
+            length = self.player.get_length()
+            resumes = self._config.setdefault("_video_resume_", {})
+            if position > 3000 and (length <= 0 or position < length - 3000):
+                resumes[key] = position
+            else:
+                resumes.pop(key, None)
+            self._save_config()
+        except Exception:
+            pass
+
+    def _save_video_options(self):
+        self._config.setdefault("_video_", {}).update({
+            "repeat_one": self._repeat_one,
+            "repeat_playlist": self._repeat_playlist,
+            "shuffle_playlist": self._shuffle_playlist,
+            "zoom": self._video_zoom,
+        })
+        self._save_config()
+
+    def zoom_in(self):
+        if self.is_video:
+            self.change_video_zoom(0.25)
+        else:
+            self.zoom_center(1.25)
+
+    def zoom_out(self):
+        if self.is_video:
+            self.change_video_zoom(-0.25)
+        else:
+            self.zoom_center(0.8)
+
+    def change_video_zoom(self, delta):
+        self._video_zoom = clamp(round(self._video_zoom + delta, 2), 0.5, 4.0)
+        self._apply_video_zoom()
+        self._save_video_options()
+        self._update_status()
+
+    def reset_video_zoom(self):
+        self._video_zoom = 1.0
+        self._apply_video_zoom()
+        self._save_video_options()
+        self._update_status()
+
+    def _apply_video_zoom(self):
+        if not self.player or not self.is_video or self._video_is_stopping():
+            return
+        try:
+            self.player.video_set_scale(self._video_zoom)
+        except Exception:
+            pass
+
+    def toggle_ab_repeat(self):
+        if not self.is_video:
+            return
+        try:
+            current = self.player.get_time()
+        except Exception:
+            return
+        if self._ab_start_ms is None:
+            self._ab_start_ms = current
+            self.status.configure(text="已设置 A 点：" + self._fmt_time(current))
+        elif self._ab_end_ms is None and current > self._ab_start_ms + 200:
+            self._ab_end_ms = current
+            self.status.configure(text="A-B 循环：%s - %s" % (
+                self._fmt_time(self._ab_start_ms), self._fmt_time(current)))
+        else:
+            self._ab_start_ms = None
+            self._ab_end_ms = None
+            self.status.configure(text="已清除 A-B 循环")
+        self._sync_toggle_buttons()
+
+    def toggle_repeat_one(self):
+        self._repeat_one = not self._repeat_one
+        self._save_video_options()
+        self._sync_toggle_buttons()
+
+    def toggle_repeat_playlist(self):
+        self._repeat_playlist = not self._repeat_playlist
+        self._save_video_options()
+        self._sync_toggle_buttons()
+
+    def toggle_shuffle_playlist(self):
+        self._shuffle_playlist = not self._shuffle_playlist
+        self._save_video_options()
+        self._sync_toggle_buttons()
 
     def _load_subtitle_for(self, src):
         """按需为视频加载同名字幕：优先同目录的 .srt/.ass/.sub/.ssa 文件；
@@ -997,6 +1130,7 @@ class ComicViewer(tk.Tk):
         # 先置位：_stop_player 会 pump Tk 事件，期间若有残留的 after 回调
         # （如 _refresh_video_hwnd / _update_video_time_loop）会因 is_video=False
         # 而直接返回，避免在后台 stop 进行中误触 player。
+        self._save_resume_position()
         self.is_video = False
         self._stop_captions()
         self._stop_player()
@@ -1111,6 +1245,9 @@ class ComicViewer(tk.Tk):
             length = self.player.get_length()
             cur = self.player.get_time()
             if length > 0:
+                if self._resume_seek_ms is not None:
+                    self.player.set_time(min(self._resume_seek_ms, max(0, length - 3000)))
+                    self._resume_seek_ms = None
                 self.time_label.configure(text="%s / %s" % (self._fmt_time(cur), self._fmt_time(length)))
                 if time.time() - self._last_seek > 0.5:
                     self._updating_seek = True
@@ -1118,19 +1255,14 @@ class ComicViewer(tk.Tk):
                         self.seek.set(cur / length * 1000.0)
                     finally:
                         self._updating_seek = False
+                if self._ab_end_ms is not None and cur >= self._ab_end_ms:
+                    self.player.set_time(self._ab_start_ms)
+                    self._last_seek = time.time()
             if self.player.get_state() == self.vlc.State.Ended:
                 self.play_btn.configure(text="▶")
                 if not self._video_ended:
                     self._video_ended = True
-                    # 播放列表优先：有列表就继续下一轨，否则回落到文件夹顺序
-                    nxt = None
-                    if self._playlist and self._playlist_index0 is not None:
-                        if self._playlist_index0 + 1 < len(self._playlist):
-                            nxt = self._playlist[self._playlist_index0 + 1]
-                    if nxt is None and self.index < len(self.sources) - 1:
-                        nxt = self.sources[self.index + 1]
-                    if nxt is not None:
-                        self.show_file(nxt if nxt in self.sources else self.index + 1)
+                    self._play_next_at_end()
                 return
         except Exception:
             pass
@@ -1381,13 +1513,15 @@ class ComicViewer(tk.Tk):
         if not self.sources:
             return
         i %= len(self.sources)
+        if self.is_video:
+            # 在索引改变前保存旧视频的续播点，避免写入即将打开的新文件。
+            self._stop_video()
         self.index = i
         self.rotation = 0
         src = self.sources[i]
         self._record_history(src)
 
         if self._is_video(src):
-            self._stop_video()
             self.orig = None
             self._spread_img = None
             self.canvas.delete("img")
@@ -1398,7 +1532,6 @@ class ComicViewer(tk.Tk):
                 self._schedule_auto()
             return
 
-        self._stop_video()
         self._show_image_panel()
         self.is_video = False
         try:
@@ -1627,6 +1760,32 @@ class ComicViewer(tk.Tk):
         # 只有视频条上的「CC 字幕」还需要颜色状态；其余开关已移到菜单里
         self.caption_btn.configure(bg=ACCENT if self.caption_enabled else BTN_BG,
                                    fg="#fff" if self.caption_enabled else FG)
+        if hasattr(self, "ab_btn"):
+            self.ab_btn.configure(bg=ACCENT if self._ab_end_ms is not None else BTN_BG)
+            self.repeat_one_btn.configure(bg=ACCENT if self._repeat_one else BTN_BG)
+            self.repeat_list_btn.configure(bg=ACCENT if self._repeat_playlist else BTN_BG)
+            self.shuffle_btn.configure(bg=ACCENT if self._shuffle_playlist else BTN_BG)
+
+    def _play_next_at_end(self):
+        if self._repeat_one:
+            self.show_file(self.index)
+            return
+        if self._playlist and self._playlist_index0 is not None:
+            if self._shuffle_playlist and len(self._playlist) > 1:
+                choices = [i for i in range(len(self._playlist)) if i != self._playlist_index0]
+                self._playlist_index0 = random.choice(choices)
+                self._playlist_show(self._playlist[self._playlist_index0])
+                return
+            if self._playlist_index0 + 1 < len(self._playlist):
+                self._playlist_index0 += 1
+                self._playlist_show(self._playlist[self._playlist_index0])
+                return
+            if self._repeat_playlist:
+                self._playlist_index0 = 0
+                self._playlist_show(self._playlist[0])
+                return
+        if self.index < len(self.sources) - 1:
+            self.show_file(self.index + 1)
 
     def zoom_at(self, x, y, factor):
         if not self.orig:
@@ -1873,7 +2032,9 @@ class ComicViewer(tk.Tk):
         if isinstance(w, (tk.Entry, tk.Text)) and w.winfo_toplevel() is not self:
             return
         k = e.keysym
-        if k in ("Right", "Next"):
+        if self.is_video and k in ("Left", "Right"):
+            self._seek_relative((30 if (e.state & 0x0004) else 5) * (1 if k == "Right" else -1))
+        elif k in ("Right", "Next"):
             self.next()
         elif k == "space":
             if self.is_video:
@@ -1883,9 +2044,9 @@ class ComicViewer(tk.Tk):
         elif k in ("Left", "Prior"):
             self.prev()
         elif k in ("plus", "equal"):
-            self.zoom_center(1.25)
+            self.zoom_in()
         elif k in ("minus", "underscore"):
-            self.zoom_center(0.8)
+            self.zoom_out()
         elif k == "0":
             self.set_fit("window")
         elif k == "1":
@@ -2087,10 +2248,11 @@ class ComicViewer(tk.Tk):
         if self.is_video:
             name = self._display_name(self.sources[self.index])
             self.page_label.configure(text="%d / %d" % (self.index + 1, len(self.sources)))
-            self.zoom_label.configure(text="视频")
-            self.zoom_out_btn.configure(state="disabled")
-            self.zoom_in_btn.configure(state="disabled")
-            self.status.configure(text=name + "   ·   视频")
+            self.zoom_label.configure(text="画面 %d%%" % round(self._video_zoom * 100))
+            self.zoom_out_btn.configure(state="normal")
+            self.zoom_in_btn.configure(state="normal")
+            self.video_zoom_label.configure(text="画面 %d%%" % round(self._video_zoom * 100))
+            self.status.configure(text=name + "   ·   视频   ·   画面 %d%%" % round(self._video_zoom * 100))
             return
         name = self._display_name(self.sources[self.index])
         if self._spread_img is not None:
