@@ -1,12 +1,18 @@
 # 阅读进度（运行时生成）
 image_viewer.json
+播放历史.m3u
 
 # 原生崩溃日志（faulthandler 运行时生成）
 crash.log
+run.log
 
 # Python 缓存
 __pycache__/
 *.pyc
+
+# 打包输出
+build/
+dist/
 
 # 编辑器 / 系统杂物
 .vscode/

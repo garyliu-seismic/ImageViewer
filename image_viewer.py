@@ -205,7 +205,7 @@ class ComicViewer(tk.Tk):
         # 顶部工具栏（可横向滚动，避免按钮过多溢出）
         self.toolbar_outer = tk.Frame(self, bg=PANEL)
         self.toolbar_outer.pack(side="top", fill="x")
-        self.toolbar_canvas = tk.Canvas(self.toolbar_outer, bg=PANEL, height=46,
+        self.toolbar_canvas = tk.Canvas(self.toolbar_outer, bg=PANEL,
                                         highlightthickness=0, bd=0)
         self.toolbar_scroll = tk.Scrollbar(self.toolbar_outer, orient="horizontal",
                                            command=self.toolbar_canvas.xview, width=10)
@@ -214,8 +214,7 @@ class ComicViewer(tk.Tk):
         self.toolbar_scroll.pack(side="bottom", fill="x")
         self.toolbar = tk.Frame(self.toolbar_canvas, bg=PANEL, padx=8, pady=6)
         self._toolbar_win = self.toolbar_canvas.create_window((0, 0), window=self.toolbar, anchor="nw")
-        self.toolbar.bind("<Configure>", lambda e: self.toolbar_canvas.configure(
-            scrollregion=self.toolbar_canvas.bbox("all")))
+        self.toolbar.bind("<Configure>", self._resize_toolbar_canvas)
         self.toolbar_canvas.bind("<MouseWheel>", lambda e: self.toolbar_canvas.xview_scroll(int(-e.delta / 120), "units"))
         self.toolbar_canvas.bind("<Shift-MouseWheel>", lambda e: self.toolbar_canvas.xview_scroll(int(-e.delta / 120), "units"))
 
@@ -419,6 +418,11 @@ class ComicViewer(tk.Tk):
                       cursor="hand2", font=("Microsoft YaHei", 10))
         b.pack(side="left", padx=2)
         return b
+
+    def _resize_toolbar_canvas(self, event=None):
+        self.toolbar_canvas.configure(
+            height=self.toolbar.winfo_reqheight(),
+            scrollregion=self.toolbar_canvas.bbox("all"))
 
     def _sep(self, parent):
         tk.Frame(parent, bg="#3a3f47", width=1, height=22).pack(side="left", padx=6, pady=2)
