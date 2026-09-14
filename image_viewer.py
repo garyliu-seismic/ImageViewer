@@ -61,7 +61,7 @@ except Exception:
         pass
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ExifTags
     RESAMPLE = Image.Resampling.LANCZOS
 except ImportError:
     print("缺少 Pillow 库，请先安装： pip install Pillow")
@@ -77,7 +77,24 @@ CAPTION_MODES = ["原声", "中文翻译", "AI 翻译"]
 CAPTION_MODE_CODES = {"原声": "original", "中文翻译": "translate", "AI 翻译": "ai_translate"}
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "image_viewer.json")
+HISTORY_PLAYLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "播放历史.m3u")
+HISTORY_LIMIT = 100
 
+RATE_OPTS = ["0.5", "0.75", "1.0", "1.25", "1.5", "2.0", "2.5", "3.0", "4.0",
+             "5.0", "6.0", "8.0", "10.0", "12.0", "15.0", "20.0", "30.0",
+             "40.0", "50.0", "60.0"]
+
+
+def _is_same_subtitle(a: str, b: str) -> bool:
+    """判断两个字幕路径是否指向同一条文件（用于 _choose_subtitle 去重）。
+    """
+    if not a or not b:
+        return a == b
+    try:
+        return os.path.normcase(os.path.normpath(a)) == os.path.normcase(
+            os.path.normpath(b))
+    except Exception:
+        return False
 BG = "#14161a"
 PANEL = "#1d2026"
 BTN_BG = "#262a33"
@@ -128,6 +145,7 @@ class ComicViewer(tk.Tk):
         self.display = None
         self.photo = None
         self.canvas_img = None
+        self._compare_img = None
 
         self._drag = None
         self._click_after = None
@@ -163,6 +181,18 @@ class ComicViewer(tk.Tk):
         self._captioner = None
         self._caption_poll_after = None
         self._caption_await_after = None
+
+        # 视频增强：外挂字幕 / 播放速率 / 播放列表 / 图片对比模式
+        self._sub_path = None          # 外接字幕文件路径（str），None=未设置
+        self._sub_path_auto = False    # 当前字幕是否由同名自动发现
+        self._sub_load_enabled = self._config.get("_video_", {}).get("auto_sub", True)  # 打开视频时自动加载同名字幕
+        self._rate = 1.0               # 播放速率（0.5 ~ 60.0）
+        self._speed_idx = 2            # 速度档位索引（默认 1.0）
+        # 播放列表：[(源名, 实际路径/元组), ...]
+        self._playlist = []
+        self._playlist_index0 = None   # 播放列表里的起始索引
+        self._compare_mode = False     # 图片对比模式（两图并排）
+        self._sub_load_guard = False   # _load_subtitle_for 内加载字幕时的重入保护
 
         self._build_ui()
         self._build_menu()
@@ -244,6 +274,22 @@ class ComicViewer(tk.Tk):
         self.vol = ttk.Scale(self.video_bar, from_=0, to=100, orient="horizontal", command=self._on_volume)
         self.vol.set(100)
         self.vol.pack(side="left", fill="x", padx=6, ipadx=40)
+        self.sub_btn = self._state_btn(self.video_bar, "外挂字幕", self._choose_subtitle)
+        self.sub_var = tk.StringVar(value="无")
+        self.sub_combo = ttk.Combobox(self.video_bar, textvariable=self.sub_var,
+                                      state="readonly", width=5,
+                                      values=["无", "自动", "手动"])
+        self.sub_combo.pack(side="left", padx=(8, 2))
+        self.sub_combo.bind("<<ComboboxSelected>>", self._on_sub_mode_change)
+        tk.Label(self.video_bar, text="×", bg=PANEL, fg=FG,
+                 font=("Segoe UI", 11, "bold")).pack(side="left")
+        self.rate_minus_btn = self._state_btn(self.video_bar, "慢", lambda: self.rate_change(-1))
+        self.rate_label = tk.Label(self.video_bar, text="1.0×", bg=PANEL, fg=FG,
+                                   font=("Consolas", 10, "bold"))
+        self.rate_label.pack(side="left", padx=(6, 6))
+        self.rate_plus_btn = self._state_btn(self.video_bar, "快", lambda: self.rate_change(1))
+        self.rate_btn = self._state_btn(self.video_bar, "变速", self._choose_rate)
+
         self.caption_btn = self._state_btn(self.video_bar, "CC 字幕", self.toggle_captions)
         self.caption_lang_var = tk.StringVar(value="英文")
         self.caption_lang_combo = ttk.Combobox(self.video_bar, textvariable=self.caption_lang_var,
@@ -283,6 +329,9 @@ class ComicViewer(tk.Tk):
         file_menu.add_command(label="打开文件夹", command=self.open_folder)
         file_menu.add_command(label="打开图片", command=self.open_files)
         file_menu.add_command(label="打开压缩包 (zip/cbz)", command=self.open_zip)
+        file_menu.add_command(label="打开播放列表 (m3u/m3u8)", command=self.open_playlist)
+        file_menu.add_command(label="打开历史播放", command=self.open_history_playlist)
+        file_menu.add_command(label="详细信息", command=self.show_details)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self._on_close)
         menubar.add_cascade(label="文件", menu=file_menu)
@@ -305,11 +354,19 @@ class ComicViewer(tk.Tk):
         view.add_separator()
         view.add_command(label="顺时针旋转 90°", command=lambda: self.rotate(90), accelerator="R")
         view.add_command(label="逆时针旋转 90°", command=lambda: self.rotate(-90), accelerator="Shift+R")
+        view.add_separator()
+        view.add_command(label="外挂字幕 (.srt/.ass)", command=self._choose_subtitle, accelerator="S")
+        view.add_command(label="播放速率 +1 档", command=lambda: self.rate_change(1))
+        view.add_command(label="播放速率 -1 档", command=lambda: self.rate_change(-1))
+        view.add_command(label="下一轨（播放列表）", command=self._playlist_forward)
+        view.add_command(label="上一轨（播放列表）", command=self._playlist_back)
+        view.add_command(label="图片对比模式（两图并排）", command=self.toggle_compare)
         menubar.add_cascade(label="视图", menu=view)
 
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="使用帮助", command=self.show_help, accelerator="?")
         help_menu.add_command(label="AI 字幕翻译设置", command=self._open_ai_settings)
+        help_menu.add_command(label="打开/关闭同名字幕自动加载", command=self.toggle_subtitle_load)
         menubar.add_cascade(label="帮助", menu=help_menu)
 
         self.configure(menu=menubar)
@@ -453,6 +510,8 @@ class ComicViewer(tk.Tk):
         elif imgs:
             imgs.sort(key=lambda p: natural_key(os.path.basename(p)))
             self._close_zip()
+            self._playlist = []
+            self._playlist_index0 = None
             self.book_key = "files:" + hashlib.sha1("|".join(imgs).encode("utf-8")).hexdigest()[:16]
             self._load_list(imgs)
 
@@ -461,6 +520,76 @@ class ComicViewer(tk.Tk):
                                        filetypes=[("压缩包", "*.zip *.cbz"), ("所有文件", "*.*")])
         if p:
             self._load_zip_path(p)
+
+    def open_playlist(self):
+        path = filedialog.askopenfilename(
+            title="选择播放列表",
+            filetypes=[("播放列表", "*.m3u *.m3u8"), ("所有文件", "*.*")])
+        if not path:
+            return
+        self._load_playlist_path(path)
+
+    def open_history_playlist(self):
+        if not os.path.isfile(HISTORY_PLAYLIST_PATH):
+            messagebox.showinfo("提示", "尚无播放历史。打开本地图片或视频后会自动创建。")
+            return
+        self._load_playlist_path(HISTORY_PLAYLIST_PATH)
+
+    def _load_playlist_path(self, path):
+        try:
+            with open(path, "r", encoding="utf-8-sig") as playlist_file:
+                lines = playlist_file.readlines()
+        except UnicodeDecodeError:
+            try:
+                with open(path, "r", encoding="gb18030") as playlist_file:
+                    lines = playlist_file.readlines()
+            except Exception as error:
+                messagebox.showerror("错误", "无法读取播放列表：%s" % error)
+                return
+        except Exception as error:
+            messagebox.showerror("错误", "无法读取播放列表：%s" % error)
+            return
+
+        base_dir = os.path.dirname(path)
+        sources = []
+        for line in lines:
+            entry = line.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            source = entry if os.path.isabs(entry) else os.path.normpath(os.path.join(base_dir, entry))
+            if os.path.isfile(source):
+                sources.append(source)
+        if not sources:
+            messagebox.showinfo("提示", "播放列表中没有可访问的媒体文件。")
+            return
+
+        self._close_zip()
+        self.book_key = "playlist:" + os.path.abspath(path)
+        self._playlist = list(sources)
+        self._playlist_index0 = 0
+        self._load_list(sources)
+
+    def _record_history(self, src):
+        """将实际播放的本地媒体写入最近播放 M3U，最新记录置顶。"""
+        if isinstance(src, tuple) or not os.path.isfile(src):
+            return
+        path = os.path.abspath(src)
+        try:
+            history = []
+            if os.path.isfile(HISTORY_PLAYLIST_PATH):
+                with open(HISTORY_PLAYLIST_PATH, "r", encoding="utf-8-sig") as history_file:
+                    history = [line.strip() for line in history_file
+                               if line.strip() and not line.startswith("#")]
+            key = os.path.normcase(os.path.normpath(path))
+            history = [entry for entry in history
+                       if os.path.normcase(os.path.normpath(entry)) != key]
+            history.insert(0, path)
+            with open(HISTORY_PLAYLIST_PATH, "w", encoding="utf-8") as history_file:
+                history_file.write("#EXTM3U\n")
+                history_file.write("\n".join(history[:HISTORY_LIMIT]))
+                history_file.write("\n")
+        except OSError:
+            pass
 
     def _load_zip_path(self, p):
         try:
@@ -472,6 +601,8 @@ class ComicViewer(tk.Tk):
                 return
             names.sort(key=lambda n: natural_key(n.replace("\\", "/").split("/")[-1]))
             self._close_zip()
+            self._playlist = []
+            self._playlist_index0 = None
             self._zip = zipfile.ZipFile(p)
             self.book_key = p
             self._load_list([(p, n) for n in names])
@@ -486,6 +617,8 @@ class ComicViewer(tk.Tk):
             messagebox.showinfo("提示", "该文件夹下没有找到图片或视频文件。")
             return
         self._close_zip()
+        self._playlist = []
+        self._playlist_index0 = None
         self.book_key = d
         self._load_list(files)
 
@@ -507,6 +640,7 @@ class ComicViewer(tk.Tk):
                 self.spread_mode = bool(cfg.get("spread_mode", True))
                 self.reading_direction = "rtl" if cfg.get("direction") == "rtl" else "ltr"
                 self.trim_mode = bool(cfg.get("trim_mode", False))
+                self._compare_mode = bool(cfg.get("compare_mode", False))
                 fm = cfg.get("fit_mode", "window")
                 self.fit_mode = fm if fm in ("width", "height", "window", "actual") else "window"
             except Exception:
@@ -659,12 +793,20 @@ class ComicViewer(tk.Tk):
             self._cancel_auto()
             self._sync_toggle_buttons()
         self._video_ended = False
+        # 打开新视频时按文件名自动加载外接字幕；速率在用户调整后持久化
+        self._load_subtitle_for(self.sources[self.index])
+        self._apply_rate_now()
         self._show_video_panel()
         try:
             # 关掉 D3D11VA 硬件解码：必须作为 media 选项传才生效（Instance 上的
             # --avcodec-hw=none 在 VLC 3.0.20 里不生效；而且 set_hwnd() 会把
             # avcodec-hw 重置为空）。否则切视频时解码器收尾会死锁。
-            media = self.vlc_instance.media_new(path, ":avcodec-hw=none")
+            opts = [":avcodec-hw=none", ":rate=%.3f" % self._rate, ":audio-time-stretch"]
+            if self._sub_path:
+                # 外挂字幕文件（.srt/.ass/.sub/.ssa）：交给 VLC 内置字幕解码器
+                # 渲染到画面。set_media 后补一次 sub-file，避免 set_hwnd 把它重置。
+                opts.append(":sub-file=" + self._sub_path.replace("\\", "/"))
+            media = self.vlc_instance.media_new(path, *opts)
             self.player.set_media(media)
             self.player.set_hwnd(self.video_panel.winfo_id())
             # 字幕的 audio_set_format/audio_set_callbacks 必须在 play() 之前设置，
@@ -672,6 +814,7 @@ class ComicViewer(tk.Tk):
             if self.caption_enabled:
                 self._start_captions()
             self.player.play()
+            self._apply_rate_now()
             self.player.audio_set_volume(int(self.vol.get()))
             self.is_video = True
             self.play_btn.configure(text="⏸")
@@ -692,6 +835,156 @@ class ComicViewer(tk.Tk):
             self.focus_force()
         except Exception:
             pass
+
+    def _load_subtitle_for(self, src):
+        """按需为视频加载同名字幕：优先同目录的 .srt/.ass/.sub/.ssa 文件；
+        找不到时若已设了别的字幕则清空，避免残留。调用前会设置
+        _sub_load_guard 防止再触发对外接字幕的显式加载。"""
+        if not src or not self._sub_load_enabled or self._sub_load_guard:
+            return
+        name = (src[1] if isinstance(src, tuple) else src)
+        if not os.path.dirname(name):
+            # zip 内条目无法根据条目名找同名外部文件
+            return
+        stem = os.path.splitext(name)[0]
+        parent = os.path.dirname(name)
+        self._sub_load_guard = True
+        try:
+            for ext in (".srt", ".ass", ".ssa", ".sub", ".scc", ".smi", ".sbv"):
+                cand = os.path.join(parent, stem + ext)
+                if os.path.exists(cand):
+                    self.set_external_subtitle(cand)
+                    return
+            if self._sub_path_auto:
+                self.set_external_subtitle(None)
+        finally:
+            self._sub_load_guard = False
+
+    def set_external_subtitle(self, file_path):
+        """设置 / 清空外接字幕文件。设置后下次打开视频（含翻页）会自动生效。
+
+        file_path 为 None 表示关闭外接字幕。"""
+        old = self._sub_path
+        self._sub_path = file_path or None
+        self._sub_path_auto = bool(file_path and self._sub_load_guard)
+        # 通过 _load_subtitle_for 内部加载时不触发改片（防重入），仅用户手动
+        # 切换字幕时才重新起片，以免在 _show_video 执行中途反复自调用。
+        if self._sub_load_guard:
+            if file_path:
+                self.caption_enabled = False
+                self._sync_toggle_buttons()
+            return
+        # 外接字幕后，AI 实时识别字幕应关闭，避免两条字幕重叠
+        if file_path:
+            self.caption_enabled = False
+            self._sync_toggle_buttons()
+        if self.is_video and old != self._sub_path:
+            self._show_video(self.sources[self.index])
+
+    def toggle_subtitle_load(self):
+        """切换视频打开时是否自动加载同名外接字幕。"""
+        self._sub_load_enabled = not self._sub_load_enabled
+        self._config.setdefault("_video_", {})["auto_sub"] = self._sub_load_enabled
+        self._save_config()
+
+    def _set_rate(self, rate):
+        """设置播放速率（0.5 ~ 60.0），持久化 _speed_idx 并应用给 VLC。"""
+        self._rate = clamp(rate, 0.5, 60.0)
+        idx = 0
+        while idx < len(RATE_OPTS) - 1 and self._rate > float(RATE_OPTS[idx]):
+            idx += 1
+        self._speed_idx = idx
+        if self.is_video:
+            self.zoom_label.configure(text="%s倍" % self._rate)
+        if self.player and not self._video_is_stopping():
+            try:
+                if self._video_is_stopping():
+                    return
+                self.player.set_rate(self._rate)
+            except Exception:
+                pass
+
+    def _run_rate(self, delta=1):
+        """+/- 快捷键：按 _speed_idx 步长调整播放速率。"""
+        idx = self._speed_idx + delta
+        if idx < 0:
+            idx = 0
+        if idx > len(RATE_OPTS) - 1:
+            idx = len(RATE_OPTS) - 1
+        self._set_rate(float(RATE_OPTS[idx]))
+
+    def rate_change(self, delta):
+        """+/− 快捷键：以步长调整播放速率（1:加快，-1:减慢）。"""
+        self._run_rate(delta)
+
+    def _choose_rate(self):
+        rate = simpledialog.askfloat(
+            "变速", "输入播放速率（0.5 - 60.0）：",
+            initialvalue=self._rate, minvalue=0.5, maxvalue=60.0, parent=self)
+        if rate is not None:
+            self._set_rate(rate)
+
+    def _apply_rate_now(self):
+        """打开视频时立即把速率应用给 VLC（set_hwnd 之后调用）。"""
+        if self.player and not self._video_is_stopping():
+            try:
+                head = min(self._speed_idx, len(RATE_OPTS) - 1)
+                self.player.set_rate(float(RATE_OPTS[head]))
+            except Exception:
+                pass
+
+    def _add_to_playlist(self, src):
+        """把当前源加入播放列表（去重同名）。
+        """
+        for s in self._playlist:
+            if s == src:
+                self._playlist_index0 = self._playlist.index(src)
+                self._update_status()
+                return
+        self._playlist.append(src)
+        self._playlist_index0 = len(self._playlist) - 1
+
+    def _playlist_forward(self):
+        """播放列表下一轨并播放。
+        """
+        if not self._playlist:
+            return
+        if self._playlist_index0 is None:
+            # 列表里还没记录位置，找当前源
+            for i, s in enumerate(self._playlist):
+                if s == self.sources[self.index]:
+                    self._playlist_index0 = i
+                    break
+            else:
+                self._playlist_index0 = None
+                return
+        nxt = min(self._playlist_index0 + 1, len(self._playlist) - 1)
+        self._playlist_index0 = nxt
+        self._playlist_show(self._playlist[nxt])
+
+    def _playlist_back(self):
+        """播放列表上一轨并播放。
+        """
+        if not self._playlist:
+            return
+        if self._playlist_index0 is None:
+            for i, s in enumerate(self._playlist):
+                if s == self.sources[self.index]:
+                    self._playlist_index0 = i
+                    break
+            else:
+                self._playlist_index0 = None
+                return
+        nxt = max(self._playlist_index0 - 1, 0)
+        self._playlist_index0 = nxt
+        self._playlist_show(self._playlist[nxt])
+
+    def _playlist_show(self, src):
+        """切换到播放列表里某一项并播放（保持播放列表连续性）。
+        """
+        self.sources = list(self._playlist)
+        self._playlist_index0 = self._playlist.index(src)
+        self.show_file(self._playlist_index0)
 
     def _stop_video(self):
         if self._video_timer:
@@ -825,12 +1118,26 @@ class ComicViewer(tk.Tk):
                 self.play_btn.configure(text="▶")
                 if not self._video_ended:
                     self._video_ended = True
-                    if self.index < len(self.sources) - 1:
-                        self.after(300, self.next)
+                    # 播放列表优先：有列表就继续下一轨，否则回落到文件夹顺序
+                    nxt = None
+                    if self._playlist and self._playlist_index0 is not None:
+                        if self._playlist_index0 + 1 < len(self._playlist):
+                            nxt = self._playlist[self._playlist_index0 + 1]
+                    if nxt is None and self.index < len(self.sources) - 1:
+                        nxt = self.sources[self.index + 1]
+                    if nxt is not None:
+                        self.show_file(nxt if nxt in self.sources else self.index + 1)
                 return
         except Exception:
             pass
         self._video_timer = self.after(500, self._update_video_time_loop)
+
+        # 刷新视频条上的字幕/速率按钮状态（~2Hz，轻量，避免手动在各处重绘）
+        try:
+            self._sync_subtitle_button()
+            self.rate_label.configure(text="%.1f\u00d7" % self._rate)
+        except Exception:
+            pass
 
     def toggle_captions(self):
         self.caption_enabled = not self.caption_enabled
@@ -850,6 +1157,34 @@ class ComicViewer(tk.Tk):
         self._save_config()
         if self.is_video:
             self._reposition_caption_window()
+
+    def _on_sub_mode_change(self, event=None):
+        """字幕模式选择：自动=每开视频自动加载同名 srt；手动=只加载当前一次。"""
+        mode = self.sub_var.get()
+        self._sub_load_enabled = (mode == "自动")
+
+    def _choose_subtitle(self):
+        """弹出文件选择：选择/清空外接字幕文件 .srt/.ass/.sub/.ssa。"""
+        if not self.sources:
+            return
+        names = [
+            ("字幕文件", "*.srt *.ass *.ssa *.sub *.scc *.smi *.sbv"),
+            ("所有文件", "*.*"),
+        ]
+        path = filedialog.askopenfilename(
+            title="选择外接字幕文件",
+            filetypes=names)
+        if path and not _is_same_subtitle(path, self._sub_path):
+            self.set_external_subtitle(path)
+
+    def _sync_subtitle_button(self):
+        """刷新视频条字幕按钮状态（文本 + 列表）。"""
+        self.sub_var.set("自动" if self._sub_load_enabled else "手动")
+        active = bool(self._sub_path)
+        self.sub_btn.configure(bg=ACCENT if active else BTN_BG,
+                               fg="#fff" if active else FG)
+        if self.rate_label.winfo_exists():
+            self.rate_label.configure(text="%.1f×" % self._rate)
 
     def _on_caption_lang_change(self, event=None):
         if self.caption_lang_var.get() == "中文":
@@ -1045,6 +1380,7 @@ class ComicViewer(tk.Tk):
         self.index = i
         self.rotation = 0
         src = self.sources[i]
+        self._record_history(src)
 
         if self._is_video(src):
             self._stop_video()
@@ -1117,6 +1453,8 @@ class ComicViewer(tk.Tk):
         im = src
         if self.rotation:
             im = im.rotate(self.rotation, expand=True)
+        if self._compare_mode and getattr(self, "_compare_img", None) is not None:
+            im = self._compare_img
         if (dw, dh) != im.size:
             im = im.resize((dw, dh), RESAMPLE)
 
@@ -1209,6 +1547,38 @@ class ComicViewer(tk.Tk):
         if self.sources and not self.is_video:
             self.show_file(self.index)
         self._save_progress()
+
+    def toggle_compare(self):
+        """切换图片对比模式（连续两图并排显示）。
+        """
+        self._compare_mode = not self._compare_mode
+        self._config.setdefault("_ui_", {})["compare_mode"] = self._compare_mode
+        self._save_config()
+        if self.sources and not self.is_video:
+            self._render()
+
+    def _render_compare(self):
+        """把连续两张图并排渲染进画布（对比模式）。
+        """
+        if not self.orig or self.is_video:
+            return
+        if self.index >= len(self.sources) - 1:
+            return
+        try:
+            a = self.orig
+            b = self._open_image(self.sources[self.index + 1])
+        except Exception:
+            return
+        aa = a.convert("RGB")
+        bb = b.convert("RGB")
+        w1, h1 = aa.size
+        w2, h2 = bb.size
+        H = max(h1, h2)
+        merged = Image.new("RGB", (w1 + w2, H), "#000")
+        merged.paste(aa, (0, (H - h1) // 2))
+        merged.paste(bb, (w1, (H - h2) // 2))
+        self._compare_img = merged
+        self._render()
 
     def toggle_auto(self):
         if self.auto_flip:
@@ -1528,6 +1898,9 @@ class ComicViewer(tk.Tk):
             self.toggle_direction()
         elif k in ("c", "C"):
             self.toggle_trim()
+        elif k in ("s", "S"):
+            if self.is_video:
+                self._choose_subtitle()
         elif k in ("a", "A"):
             self.toggle_auto()
         elif k == "bracketleft":
@@ -1659,6 +2032,51 @@ class ComicViewer(tk.Tk):
                 self.thumbs.xview_moveto(max(0.0, (first - 20) / total[2]))
 
     # ---------------- 信息 ----------------
+    def show_details(self):
+        if not self.sources:
+            return
+        src = self.sources[self.index]
+        name = self._display_name(src)
+        details = ["文件名: " + name]
+        if isinstance(src, tuple):
+            details.append("来源: " + src[0])
+            details.append("压缩包条目: " + src[1])
+        else:
+            try:
+                details.append("路径: " + os.path.abspath(src))
+                details.append("大小: %s 字节" % os.path.getsize(src))
+            except OSError:
+                pass
+
+        if self._is_video(src):
+            duration = None
+            path = self._video_path(src)
+            if path and self._ensure_vlc():
+                try:
+                    media = self.vlc_instance.media_new(path)
+                    media.parse()
+                    duration = media.get_duration()
+                except Exception:
+                    pass
+            details.append("类型: 视频")
+            if duration is not None and duration >= 0:
+                details.append("时长: " + self._fmt_time(duration))
+        else:
+            try:
+                with self._open_raw(src) as image:
+                    details.extend([
+                        "类型: " + (image.format or "未知"),
+                        "尺寸: %d × %d" % image.size,
+                        "颜色模式: " + image.mode,
+                    ])
+                    exif = image.getexif()
+                    for tag, value in exif.items():
+                        tag_name = ExifTags.TAGS.get(tag, str(tag))
+                        details.append("EXIF %s: %s" % (tag_name, value))
+            except Exception as error:
+                details.append("无法读取图像元数据: %s" % error)
+        messagebox.showinfo("详细信息", "\n".join(details), parent=self)
+
     def _update_status(self):
         if not self.sources:
             return
