@@ -203,6 +203,20 @@ class ComicViewer(tk.Tk):
         self._compare_mode = False     # 图片对比模式（两图并排）
         self._sub_load_guard = False   # _load_subtitle_for 内加载字幕时的重入保护
 
+        # 投屏（DLNA / Chromecast）
+        self._cast_items = {}          # 设备名 -> dlna_cast.DlnaRenderer
+        self._cast_dialog = None       # 投屏设备选择窗口
+        self._cast_listbox = None      # 设备列表控件
+        self._cast_status_label = None
+        self._cast_name = None         # 当前投屏的设备名，None=本地播放
+        self._cast_mode = None         # None=本地播放, "dlna"=DLNA 投屏
+        self._dlna = None              # dlna_cast.DlnaRenderer
+        self._dlna_server = None       # dlna_cast.LocalMediaServer
+        self._dlna_playing = False     # DLNA 播放/暂停状态
+        self._dlna_total = 0           # DLNA 缓存的总时长（秒）
+        self._dlna_pos = 0             # 本地计时的当前秒数
+        self._dlna_sync_tick = 0       # 校准计数器
+
         self._build_ui()
         self._build_menu()
         self._bind_events()
@@ -282,31 +296,12 @@ class ComicViewer(tk.Tk):
         self.vol = ttk.Scale(self.video_bar, from_=0, to=100, orient="horizontal", command=self._on_volume)
         self.vol.set(100)
         self.vol.pack(side="left", fill="x", padx=6, ipadx=40)
-        self.sub_btn = self._state_btn(self.video_bar, "外挂字幕", self._choose_subtitle)
-        self.sub_var = tk.StringVar(value="无")
-        self.sub_combo = ttk.Combobox(self.video_bar, textvariable=self.sub_var,
-                                      state="readonly", width=5,
-                                      values=["无", "自动", "手动"])
-        self.sub_combo.pack(side="left", padx=(8, 2))
-        self.sub_combo.bind("<<ComboboxSelected>>", self._on_sub_mode_change)
-        tk.Label(self.video_bar, text="×", bg=PANEL, fg=FG,
-                 font=("Segoe UI", 11, "bold")).pack(side="left")
+        # 其余不常用开关（外挂字幕/循环/画面缩放/字幕位置）已移到「视图」菜单
         self.rate_minus_btn = self._state_btn(self.video_bar, "慢", lambda: self.rate_change(-1))
         self.rate_label = tk.Label(self.video_bar, text="1.0×", bg=PANEL, fg=FG,
                                    font=("Consolas", 10, "bold"))
         self.rate_label.pack(side="left", padx=(6, 6))
         self.rate_plus_btn = self._state_btn(self.video_bar, "快", lambda: self.rate_change(1))
-        self.rate_btn = self._state_btn(self.video_bar, "变速", self._choose_rate)
-        self.video_zoom_out_btn = self._state_btn(self.video_bar, "画面-", lambda: self.change_video_zoom(-0.25))
-        self.video_zoom_label = tk.Label(self.video_bar, text="画面 100%", bg=PANEL, fg=FG,
-                         font=("Consolas", 10))
-        self.video_zoom_label.pack(side="left", padx=(4, 4))
-        self.video_zoom_in_btn = self._state_btn(self.video_bar, "画面+", lambda: self.change_video_zoom(0.25))
-        self.video_zoom_reset_btn = self._state_btn(self.video_bar, "重置画面", self.reset_video_zoom)
-        self.ab_btn = self._state_btn(self.video_bar, "A-B", self.toggle_ab_repeat)
-        self.repeat_one_btn = self._state_btn(self.video_bar, "单曲循环", self.toggle_repeat_one)
-        self.repeat_list_btn = self._state_btn(self.video_bar, "列表循环", self.toggle_repeat_playlist)
-        self.shuffle_btn = self._state_btn(self.video_bar, "随机", self.toggle_shuffle_playlist)
 
         self.caption_btn = self._state_btn(self.video_bar, "CC 字幕", self.toggle_captions)
         self.caption_lang_var = tk.StringVar(value="英文")
@@ -319,10 +314,7 @@ class ComicViewer(tk.Tk):
                                                values=CAPTION_MODES, state="readonly", width=9)
         self.caption_mode_combo.pack(side="left", padx=2)
         self.caption_mode_combo.bind("<<ComboboxSelected>>", self._on_caption_mode_change)
-        self.caption_pos_btn = self._state_btn(
-            self.video_bar,
-            "字幕位置: " + ("顶部" if self.caption_pos == "top" else "底部"),
-            self.toggle_caption_pos)
+        self.cast_btn = self._state_btn(self.video_bar, "📺 投屏", self.toggle_cast)
 
         # VLC 硬件加速（D3D11）在 video_panel 的原生窗口上直接画视频画面，会盖住
         # 任何叠在它上面的 Tk 子控件 -- Tk 的 lift()/z-order 对这种系统合成层面
@@ -383,6 +375,14 @@ class ComicViewer(tk.Tk):
         view.add_command(label="下一轨（播放列表）", command=self._playlist_forward)
         view.add_command(label="上一轨（播放列表）", command=self._playlist_back)
         view.add_command(label="图片对比模式（两图并排）", command=self.toggle_compare)
+        view.add_separator()
+        view.add_command(label="变速...", command=self._choose_rate)
+        view.add_command(label="画面放大 +25%", command=lambda: self.change_video_zoom(0.25))
+        view.add_command(label="画面缩小 -25%", command=lambda: self.change_video_zoom(-0.25))
+        view.add_command(label="重置画面缩放", command=self.reset_video_zoom)
+        view.add_command(label="字幕位置 顶部/底部", command=self.toggle_caption_pos)
+        view.add_separator()
+        view.add_command(label="投屏到电视 / 设备", command=self.toggle_cast)
         menubar.add_cascade(label="视图", menu=view)
 
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -503,6 +503,7 @@ class ComicViewer(tk.Tk):
 
     def _on_close(self):
         self._cancel_auto()
+        self._close_cast_dialog()
         self._stop_video()
         self._save_progress()
         self._close_zip()
@@ -919,6 +920,8 @@ class ComicViewer(tk.Tk):
             self.zoom_center(0.8)
 
     def change_video_zoom(self, delta):
+        if self._cast_mode == "dlna":
+            return  # DLNA 投屏不支持画面缩放
         self._video_zoom = clamp(round(self._video_zoom + delta, 2), 0.5, 4.0)
         self._apply_video_zoom()
         self._save_video_options()
@@ -1052,6 +1055,9 @@ class ComicViewer(tk.Tk):
 
     def rate_change(self, delta):
         """+/− 快捷键：以步长调整播放速率（1:加快，-1:减慢）。"""
+        if self._cast_mode == "dlna":
+            self.status.configure(text="投屏模式不支持倍速（DLNA 限制）")
+            return
         self._run_rate(delta)
 
     def _choose_rate(self):
@@ -1123,10 +1129,226 @@ class ComicViewer(tk.Tk):
         self._playlist_index0 = self._playlist.index(src)
         self.show_file(self._playlist_index0)
 
+    # ---------------- 投屏（DLNA / Chromecast） -------------
+    def toggle_cast(self):
+        """投屏按钮：打开设备选择 / 取消当前投屏。"""
+        if not self.is_video:
+            self.status.configure(text="投屏仅在视频页可用：请先打开一个视频")
+            return
+        if self._cast_mode == "dlna":
+            self._cancel_cast()
+        elif self._cast_dialog is not None and self._cast_dialog.winfo_exists():
+            self._cast_dialog.lift()
+            self._cast_dialog.focus_force()
+        else:
+            self._open_cast_dialog()
+
+    def _open_cast_dialog(self):
+        if self._cast_dialog is not None and self._cast_dialog.winfo_exists():
+            self._cast_dialog.destroy()
+        dlg = tk.Toplevel(self)
+        dlg.title("投屏 - 选择设备")
+        dlg.configure(bg=PANEL)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        self._cast_dialog = dlg
+
+        self._cast_status_label = tk.Label(dlg, text="正在搜索局域网里的投屏设备…", bg=PANEL, fg=FG,
+                 font=("Microsoft YaHei", 10))
+        self._cast_status_label.pack(padx=16, pady=(12, 4), anchor="w")
+        self._cast_listbox = tk.Listbox(dlg, width=44, height=9, bg=BG, fg=FG,
+                                        selectbackground=ACCENT, selectforeground="#fff",
+                                        relief="flat", bd=0, font=("Microsoft YaHei", 11),
+                                        highlightthickness=0, activestyle="none")
+        self._cast_listbox.pack(padx=16, pady=4, fill="both", expand=True)
+        btns = tk.Frame(dlg, bg=PANEL)
+        btns.pack(padx=16, pady=(0, 12), fill="x")
+        tk.Button(btns, text="投到选中设备", command=self._cast_select, takefocus=0,
+                  bg=ACCENT, fg="#fff", activebackground="#5b9aff", activeforeground="#fff",
+                  relief="flat", bd=0, padx=12, pady=5, cursor="hand2",
+                  font=("Microsoft YaHei", 10)).pack(side="left", padx=2)
+        tk.Button(btns, text="刷新", command=self._cast_rescan, takefocus=0,
+                  bg=BTN_BG, fg=FG, activebackground=BTN_ACTIVE, activeforeground="#fff",
+                  relief="flat", bd=0, padx=12, pady=5, cursor="hand2",
+                  font=("Microsoft YaHei", 10)).pack(side="left", padx=2)
+        tk.Button(btns, text="取消", command=self._close_cast_dialog, takefocus=0,
+                  bg=BTN_BG, fg=FG, activebackground=BTN_ACTIVE, activeforeground="#fff",
+                  relief="flat", bd=0, padx=12, pady=5, cursor="hand2",
+                  font=("Microsoft YaHei", 10)).pack(side="left", padx=2)
+        self._cast_listbox.bind("<Double-Button-1>", lambda e: self._cast_select())
+        dlg.protocol("WM_DELETE_WINDOW", self._close_cast_dialog)
+        self._cast_scan()
+        # 约 6 秒后若仍无设备，提示常见原因，避免用户干等
+        self.after(6000, self._cast_check_empty)
+
+    def _cast_check_empty(self):
+        if (self._cast_dialog is None or not self._cast_dialog.winfo_exists()
+                or self._cast_listbox is None):
+            return
+        n = self._cast_listbox.size()
+        if n == 0:
+            self._cast_status_label.configure(
+                text="未发现设备：请确认电视/盒子已开机、与电脑连同一 WiFi、支持 DLNA/Chromecast")
+        else:
+            self._cast_status_label.configure(
+                text="发现 %d 个设备，选中后点「投到选中设备」" % n)
+
+    def _close_cast_dialog(self):
+        if self._cast_dialog is not None:
+            try:
+                self._cast_dialog.destroy()
+            except Exception:
+                pass
+            self._cast_dialog = None
+        self._cast_listbox = None
+        self._cast_status_label = None
+
+    def _cast_scan(self):
+        """后台线程 SSDP 扫描 DLNA 渲染器（会阻塞几秒，不能放主线程）。"""
+        if self._cast_listbox is not None and self._cast_listbox.winfo_exists():
+            self._cast_listbox.delete(0, "end")
+        self._cast_items.clear()
+
+        def _scan():
+            try:
+                import dlna_cast
+                renderers = dlna_cast.discover_renderers(timeout=4)
+                for r in renderers:
+                    self._cast_items[r.name] = r
+                    self.after(0, self._cast_listbox_insert, r.name)
+            except Exception:
+                pass
+
+        threading.Thread(target=_scan, daemon=True).start()
+
+    def _cast_listbox_insert(self, name):
+        if self._cast_listbox is not None and self._cast_listbox.winfo_exists():
+            if name not in self._cast_listbox.get(0, "end"):
+                self._cast_listbox.insert("end", name)
+
+    def _cast_rescan(self):
+        self._cast_scan()
+
+    def _cast_select(self):
+        if self._cast_dialog is None or not self._cast_dialog.winfo_exists():
+            return
+        sel = self._cast_listbox.curselection()
+        if not sel:
+            return
+        name = self._cast_listbox.get(sel[0])
+        renderer = self._cast_items.get(name)
+        if renderer is None:
+            return
+        self._apply_cast(renderer, name)
+        self._close_cast_dialog()
+
+    def _apply_cast(self, renderer, name=None):
+        """投屏到 DLNA 设备；renderer 为 None 时取消投屏、恢复本地播放。
+
+        DLNA 投屏：停本地 VLC → 起本地 HTTP 服务器暴露视频 → SOAP
+        SetAVTransportURI + Play 把视频推给投影仪，之后播放/暂停/进度条
+        都通过 SOAP 控制投影仪，本地 VLC 不再参与。
+        """
+        if renderer is None:
+            self._cast_stop()
+            self._cast_name = None
+            self._sync_toggle_buttons()
+            self._show_video(self.sources[self.index])
+            self.status.configure(text="已取消投屏，恢复本地播放")
+            return
+        if not self.is_video or not self.player:
+            return
+        src = self.sources[self.index]
+        path = self._video_path(src)
+        if not path:
+            self.status.configure(text="投屏失败：无法读取视频文件")
+            return
+        self._save_resume_position()
+        self._stop_video()
+        try:
+            import dlna_cast
+            srv = dlna_cast.LocalMediaServer(path)
+            url = srv.start()
+        except Exception as e:
+            self.status.configure(text="投屏失败（无法启动媒体服务）：%s" % e)
+            self._show_video(src)
+            return
+        try:
+            renderer.set_uri(url, self._display_name(src))
+            renderer.play()
+        except Exception as e:
+            try:
+                srv.stop()
+            except Exception:
+                pass
+            self.status.configure(text="投屏失败：%s" % e)
+            self._show_video(src)
+            return
+        self._dlna = renderer
+        self._dlna_server = srv
+        self._dlna_playing = True
+        self._dlna_total = 0
+        self._dlna_pos = 0
+        self._dlna_sync_tick = 0
+        self._cast_name = name
+        self._cast_mode = "dlna"
+        self.is_video = True
+        self.play_btn.configure(text="⏸")
+        self._show_video_bar()
+        self._sync_toggle_buttons()
+        self._update_status()
+        self._update_video_time_loop()
+        self.status.configure(text="已投屏到：%s（播放/暂停/进度条控制投影仪）" % name)
+
+    def _cast_stop(self):
+        """停止 DLNA 投屏（stop + 关 HTTP 服务器），不恢复本地播放。"""
+        if self._dlna:
+            try:
+                self._dlna.stop()
+            except Exception:
+                pass
+            self._dlna = None
+        if self._dlna_server:
+            try:
+                self._dlna_server.stop()
+            except Exception:
+                pass
+            self._dlna_server = None
+        self._cast_mode = None
+        self._dlna_playing = False
+
+    def _save_dlna_position(self):
+        """把投影仪当前播放位置写入续播配置，供取消投屏后本地续播。"""
+        if not self._dlna or not self.sources:
+            return
+        try:
+            pos = self._dlna.get_position()
+            if pos and pos[0] > 1000:
+                key = self._video_resume_key(self.sources[self.index])
+                if key:
+                    self._config.setdefault("_video_resume_", {})[key] = pos[0]
+                    self._save_config()
+        except Exception:
+            pass
+
+    def _cancel_cast(self):
+        self._save_dlna_position()
+        self._apply_cast(None)
+
     def _stop_video(self):
         if self._video_timer:
             self.after_cancel(self._video_timer)
             self._video_timer = None
+        if self._cast_mode == "dlna":
+            # DLNA 投屏模式：保存投影仪位置，停 DLNA，不碰 VLC
+            self._save_dlna_position()
+            self._cast_stop()
+            self._cast_name = None
+            self._sync_toggle_buttons()
+            self.is_video = False
+            self._stop_captions()
+            self._hide_video_bar()
+            return
         # 先置位：_stop_player 会 pump Tk 事件，期间若有残留的 after 回调
         # （如 _refresh_video_hwnd / _update_video_time_loop）会因 is_video=False
         # 而直接返回，避免在后台 stop 进行中误触 player。
@@ -1203,6 +1425,21 @@ class ComicViewer(tk.Tk):
             self.update_idletasks()
 
     def _toggle_play(self):
+        if self._cast_mode == "dlna":
+            if not self._dlna:
+                return
+            try:
+                if self._dlna_playing:
+                    self._dlna.pause()
+                    self._dlna_playing = False
+                    self.play_btn.configure(text="▶")
+                else:
+                    self._dlna.play()
+                    self._dlna_playing = True
+                    self.play_btn.configure(text="⏸")
+            except Exception:
+                pass
+            return
         if not self.player or not self.is_video or self._video_is_stopping():
             return
         try:
@@ -1219,6 +1456,15 @@ class ComicViewer(tk.Tk):
         if self._updating_seek:
             return
         self._last_seek = time.time()
+        if self._cast_mode == "dlna":
+            if self._dlna and self._dlna_total > 0:
+                try:
+                    target = int(float(val) / 1000.0 * self._dlna_total)
+                    self._dlna_pos = target
+                    self._dlna.seek(target)
+                except Exception:
+                    pass
+            return
         if not self.player or not self.is_video or self._video_is_stopping():
             return
         try:
@@ -1231,6 +1477,8 @@ class ComicViewer(tk.Tk):
             pass
 
     def _on_volume(self, val):
+        if self._cast_mode == "dlna":
+            return  # DLNA 音量由投影仪控制
         if self.player and not self._video_is_stopping():
             try:
                 self.player.audio_set_volume(int(float(val)))
@@ -1239,6 +1487,9 @@ class ComicViewer(tk.Tk):
 
     def _update_video_time_loop(self):
         self._video_timer = None
+        if self._cast_mode == "dlna":
+            self._update_dlna_time_loop()
+            return
         if not self.is_video or not self.player or self._video_is_stopping():
             return
         try:
@@ -1275,7 +1526,49 @@ class ComicViewer(tk.Tk):
         except Exception:
             pass
 
+    def _update_dlna_time_loop(self):
+        """DLNA 投屏模式下的进度条轮询（1Hz，本地计时 + 定期校准）。
+
+        极米的 GetPositionInfo 响应不稳定（实测 8 秒后经常超时返回 None），
+        所以不能用它每秒更新进度条；改为本地计时每秒 +1，每 5 秒向投影仪
+        校准一次，兼顾流畅与准确。
+        """
+        self._video_timer = None
+        if self._cast_mode != "dlna" or not self._dlna or not self.is_video:
+            return
+        try:
+            if self._dlna_playing:
+                self._dlna_pos += 1
+            self._dlna_sync_tick += 1
+            if self._dlna_sync_tick >= 5:
+                self._dlna_sync_tick = 0
+                pos = self._dlna.get_position()
+                if pos:
+                    self._dlna_pos, total, _state = pos
+                    if total > 0:
+                        self._dlna_total = total
+            if self._dlna_total > 0:
+                cur = min(self._dlna_pos, self._dlna_total)
+                self.time_label.configure(
+                    text="%s / %s" % (self._fmt_time(cur), self._fmt_time(self._dlna_total)))
+                if time.time() - self._last_seek > 0.5:
+                    self._updating_seek = True
+                    try:
+                        self.seek.set(cur / self._dlna_total * 1000.0)
+                    finally:
+                        self._updating_seek = False
+        except Exception:
+            pass
+        self._video_timer = self.after(1000, self._update_dlna_time_loop)
+        try:
+            self.rate_label.configure(text="%.1f\u00d7" % self._rate)
+        except Exception:
+            pass
+
     def toggle_captions(self):
+        if self._cast_mode == "dlna":
+            self.status.configure(text="投屏模式下本地字幕不跟投（DLNA 限制）")
+            return
         self.caption_enabled = not self.caption_enabled
         self._sync_toggle_buttons()
         if self.is_video:
@@ -1287,17 +1580,10 @@ class ComicViewer(tk.Tk):
 
     def toggle_caption_pos(self):
         self.caption_pos = "top" if self.caption_pos != "top" else "bottom"
-        self.caption_pos_btn.configure(
-            text="字幕位置: " + ("顶部" if self.caption_pos == "top" else "底部"))
         self._config.setdefault("_ui_", {})["caption_pos"] = self.caption_pos
         self._save_config()
         if self.is_video:
             self._reposition_caption_window()
-
-    def _on_sub_mode_change(self, event=None):
-        """字幕模式选择：自动=每开视频自动加载同名 srt；手动=只加载当前一次。"""
-        mode = self.sub_var.get()
-        self._sub_load_enabled = (mode == "自动")
 
     def _choose_subtitle(self):
         """弹出文件选择：选择/清空外接字幕文件 .srt/.ass/.sub/.ssa。"""
@@ -1314,11 +1600,7 @@ class ComicViewer(tk.Tk):
             self.set_external_subtitle(path)
 
     def _sync_subtitle_button(self):
-        """刷新视频条字幕按钮状态（文本 + 列表）。"""
-        self.sub_var.set("自动" if self._sub_load_enabled else "手动")
-        active = bool(self._sub_path)
-        self.sub_btn.configure(bg=ACCENT if active else BTN_BG,
-                               fg="#fff" if active else FG)
+        """刷新视频条上依赖字幕/速率状态的控件。"""
         if self.rate_label.winfo_exists():
             self.rate_label.configure(text="%.1f×" % self._rate)
 
@@ -1760,11 +2042,11 @@ class ComicViewer(tk.Tk):
         # 只有视频条上的「CC 字幕」还需要颜色状态；其余开关已移到菜单里
         self.caption_btn.configure(bg=ACCENT if self.caption_enabled else BTN_BG,
                                    fg="#fff" if self.caption_enabled else FG)
-        if hasattr(self, "ab_btn"):
-            self.ab_btn.configure(bg=ACCENT if self._ab_end_ms is not None else BTN_BG)
-            self.repeat_one_btn.configure(bg=ACCENT if self._repeat_one else BTN_BG)
-            self.repeat_list_btn.configure(bg=ACCENT if self._repeat_playlist else BTN_BG)
-            self.shuffle_btn.configure(bg=ACCENT if self._shuffle_playlist else BTN_BG)
+        if hasattr(self, "cast_btn"):
+            self.cast_btn.configure(
+                text="📺 投屏中" if self._cast_name else "📺 投屏",
+                bg=ACCENT if self._cast_name else BTN_BG,
+                fg="#fff" if self._cast_name else FG)
 
     def _play_next_at_end(self):
         if self._repeat_one:
@@ -2251,7 +2533,6 @@ class ComicViewer(tk.Tk):
             self.zoom_label.configure(text="画面 %d%%" % round(self._video_zoom * 100))
             self.zoom_out_btn.configure(state="normal")
             self.zoom_in_btn.configure(state="normal")
-            self.video_zoom_label.configure(text="画面 %d%%" % round(self._video_zoom * 100))
             self.status.configure(text=name + "   ·   视频   ·   画面 %d%%" % round(self._video_zoom * 100))
             return
         name = self._display_name(self.sources[self.index])

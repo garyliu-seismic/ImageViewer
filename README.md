@@ -10,6 +10,7 @@
 | `image-viewer.html` | 网页版（单文件，浏览器直接打开） |
 | `caption_engine.py` | 视频实时字幕引擎（vosk 识别 + 翻译） |
 | `translation_engine.py` | 离线字幕翻译（Argos / ctranslate2） |
+| `dlna_cast.py` | DLNA 投屏（SSDP 发现 + AVTransport SOAP 控制 + 本地流媒体） |
 | `viewer.ico` | 程序图标 |
 | `image_viewer.json` | 阅读进度（运行时自动生成，不纳入版本控制） |
 
@@ -56,6 +57,18 @@ python image_viewer.py
 音量滑块依然不生效、音质也仍停留在 16kHz 单声道——直到切换到下一个视频才会恢复
 VLC 原生音频输出。
 
+### 投屏（视频页）
+
+视频条右侧「📺 投屏」按钮（或 视图 → 投屏到电视 / 设备）可把当前视频投到局域网里的
+DLNA 设备（极米投影仪 / 电视 / 盒子等）。原理是 DLNA：本地起一个 HTTP 服务器把视频
+暴露给设备，设备自己解码播放，本地通过 SOAP 控制播放/暂停/进度条。
+
+- 需要设备支持 DLNA（极米/小米/海信等国产设备普遍支持），且与电脑连同一 WiFi
+- 投屏后播放/暂停/进度条由本地控制投影仪；音量由投影仪控制
+- 支持格式取决于投屏设备（mp4 一般没问题；mkv 视设备而定）
+- DLNA 不支持倍速、画面缩放；本地 vosk 实时字幕不跟投
+- 再点一次按钮可取消投屏、恢复本地播放（自动续播到原进度）
+
 ### 网页版
 
 用浏览器打开 `image-viewer.html` 即可。
@@ -70,6 +83,7 @@ VLC 原生音频输出。
 - 视频播放（mp4 等，需 VLC）
   - 播放控制：倍速 0.5×~60×、进度条拖动跳转、音量、快进/快退（±5s，Ctrl=±30s）
   - 循环模式：A-B 循环 / 单曲循环 / 列表循环 / 列表随机
+  - 投屏：把视频投到局域网里的 Chromecast / DLNA 电视 / 盒子（视频条「📺 投屏」按钮）
 - 视频实时字幕（vosk 离线识别）+ 离线翻译（Argos）+ AI 翻译（LLM）+ 外挂字幕（.srt/.ass）
 - 支持格式：png / jpg / jpeg / gif / webp / bmp / tif / tiff / avif / jfif
 
