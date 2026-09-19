@@ -308,31 +308,12 @@ class ComicViewer(tk.Tk):
         self.vol = ttk.Scale(self.video_bar, from_=0, to=100, orient="horizontal", command=self._on_volume)
         self.vol.set(100)
         self.vol.pack(side="left", fill="x", padx=6, ipadx=40)
-        self.sub_btn = self._state_btn(self.video_bar, "外挂字幕", self._choose_subtitle)
-        self.sub_var = tk.StringVar(value="无")
-        self.sub_combo = ttk.Combobox(self.video_bar, textvariable=self.sub_var,
-                                      state="readonly", width=5,
-                                      values=["无", "自动", "手动"])
-        self.sub_combo.pack(side="left", padx=(8, 2))
-        self.sub_combo.bind("<<ComboboxSelected>>", self._on_sub_mode_change)
-        tk.Label(self.video_bar, text="×", bg=PANEL, fg=FG,
-                 font=("Segoe UI", 11, "bold")).pack(side="left")
+        # 其余不常用开关（外挂字幕/循环/画面缩放/字幕位置）已移到「视图」菜单
         self.rate_minus_btn = self._state_btn(self.video_bar, "慢", lambda: self.rate_change(-1))
         self.rate_label = tk.Label(self.video_bar, text="1.0×", bg=PANEL, fg=FG,
                                    font=("Consolas", 10, "bold"))
         self.rate_label.pack(side="left", padx=(6, 6))
         self.rate_plus_btn = self._state_btn(self.video_bar, "快", lambda: self.rate_change(1))
-        self.rate_btn = self._state_btn(self.video_bar, "变速", self._choose_rate)
-        self.video_zoom_out_btn = self._state_btn(self.video_bar, "画面-", lambda: self.change_video_zoom(-0.25))
-        self.video_zoom_label = tk.Label(self.video_bar, text="画面 100%", bg=PANEL, fg=FG,
-                         font=("Consolas", 10))
-        self.video_zoom_label.pack(side="left", padx=(4, 4))
-        self.video_zoom_in_btn = self._state_btn(self.video_bar, "画面+", lambda: self.change_video_zoom(0.25))
-        self.video_zoom_reset_btn = self._state_btn(self.video_bar, "重置画面", self.reset_video_zoom)
-        self.ab_btn = self._state_btn(self.video_bar, "A-B", self.toggle_ab_repeat)
-        self.repeat_one_btn = self._state_btn(self.video_bar, "单曲循环", self.toggle_repeat_one)
-        self.repeat_list_btn = self._state_btn(self.video_bar, "列表循环", self.toggle_repeat_playlist)
-        self.shuffle_btn = self._state_btn(self.video_bar, "随机", self.toggle_shuffle_playlist)
 
         self.caption_btn = self._state_btn(self.video_bar, "CC 字幕", self.toggle_captions)
         self.caption_lang_var = tk.StringVar(value="英文")
@@ -345,10 +326,6 @@ class ComicViewer(tk.Tk):
                                                values=CAPTION_MODES, state="readonly", width=9)
         self.caption_mode_combo.pack(side="left", padx=2)
         self.caption_mode_combo.bind("<<ComboboxSelected>>", self._on_caption_mode_change)
-        self.caption_pos_btn = self._state_btn(
-            self.video_bar,
-            "字幕位置: " + ("顶部" if self.caption_pos == "top" else "底部"),
-            self.toggle_caption_pos)
         self.cast_btn = self._state_btn(self.video_bar, "📺 投屏", self.toggle_cast)
 
         # VLC 硬件加速（D3D11）在 video_panel 的原生窗口上直接画视频画面，会盖住
@@ -410,6 +387,12 @@ class ComicViewer(tk.Tk):
         view.add_command(label="下一轨（播放列表）", command=self._playlist_forward)
         view.add_command(label="上一轨（播放列表）", command=self._playlist_back)
         view.add_command(label="图片对比模式（两图并排）", command=self.toggle_compare)
+        view.add_separator()
+        view.add_command(label="变速...", command=self._choose_rate)
+        view.add_command(label="画面放大 +25%", command=lambda: self.change_video_zoom(0.25))
+        view.add_command(label="画面缩小 -25%", command=lambda: self.change_video_zoom(-0.25))
+        view.add_command(label="重置画面缩放", command=self.reset_video_zoom)
+        view.add_command(label="字幕位置 顶部/底部", command=self.toggle_caption_pos)
         view.add_separator()
         view.add_command(label="投屏到电视 / 设备", command=self.toggle_cast)
         menubar.add_cascade(label="视图", menu=view)
@@ -1177,8 +1160,9 @@ class ComicViewer(tk.Tk):
         dlg.transient(self)
         self._cast_dialog = dlg
 
-        tk.Label(dlg, text="正在搜索局域网里的投屏设备…", bg=PANEL, fg=FG,
-                 font=("Microsoft YaHei", 10)).pack(padx=16, pady=(12, 4), anchor="w")
+        self._cast_status_label = tk.Label(dlg, text="正在搜索局域网里的投屏设备…", bg=PANEL, fg=FG,
+                 font=("Microsoft YaHei", 10))
+        self._cast_status_label.pack(padx=16, pady=(12, 4), anchor="w")
         self._cast_listbox = tk.Listbox(dlg, width=44, height=9, bg=BG, fg=FG,
                                         selectbackground=ACCENT, selectforeground="#fff",
                                         relief="flat", bd=0, font=("Microsoft YaHei", 11),
@@ -1201,6 +1185,20 @@ class ComicViewer(tk.Tk):
         self._cast_listbox.bind("<Double-Button-1>", lambda e: self._cast_select())
         dlg.protocol("WM_DELETE_WINDOW", self._close_cast_dialog)
         self._start_cast_discovery()
+        # 约 6 秒后若仍无设备，提示常见原因，避免用户干等
+        self.after(6000, self._cast_check_empty)
+
+    def _cast_check_empty(self):
+        if (self._cast_dialog is None or not self._cast_dialog.winfo_exists()
+                or self._cast_listbox is None):
+            return
+        n = self._cast_listbox.size()
+        if n == 0:
+            self._cast_status_label.configure(
+                text="未发现设备：请确认电视/盒子已开机、与电脑连同一 WiFi、支持 DLNA/Chromecast")
+        else:
+            self._cast_status_label.configure(
+                text="发现 %d 个设备，选中后点「投到选中设备」" % n)
 
     def _close_cast_dialog(self):
         self._stop_cast_discovery()
@@ -1211,6 +1209,7 @@ class ComicViewer(tk.Tk):
                 pass
             self._cast_dialog = None
         self._cast_listbox = None
+        self._cast_status_label = None
 
     def _start_cast_discovery(self):
         self._stop_cast_discovery()
@@ -1530,17 +1529,10 @@ class ComicViewer(tk.Tk):
 
     def toggle_caption_pos(self):
         self.caption_pos = "top" if self.caption_pos != "top" else "bottom"
-        self.caption_pos_btn.configure(
-            text="字幕位置: " + ("顶部" if self.caption_pos == "top" else "底部"))
         self._config.setdefault("_ui_", {})["caption_pos"] = self.caption_pos
         self._save_config()
         if self.is_video:
             self._reposition_caption_window()
-
-    def _on_sub_mode_change(self, event=None):
-        """字幕模式选择：自动=每开视频自动加载同名 srt；手动=只加载当前一次。"""
-        mode = self.sub_var.get()
-        self._sub_load_enabled = (mode == "自动")
 
     def _choose_subtitle(self):
         """弹出文件选择：选择/清空外接字幕文件 .srt/.ass/.sub/.ssa。"""
@@ -1557,11 +1549,7 @@ class ComicViewer(tk.Tk):
             self.set_external_subtitle(path)
 
     def _sync_subtitle_button(self):
-        """刷新视频条字幕按钮状态（文本 + 列表）。"""
-        self.sub_var.set("自动" if self._sub_load_enabled else "手动")
-        active = bool(self._sub_path)
-        self.sub_btn.configure(bg=ACCENT if active else BTN_BG,
-                               fg="#fff" if active else FG)
+        """刷新视频条上依赖字幕/速率状态的控件。"""
         if self.rate_label.winfo_exists():
             self.rate_label.configure(text="%.1f×" % self._rate)
 
@@ -2003,11 +1991,6 @@ class ComicViewer(tk.Tk):
         # 只有视频条上的「CC 字幕」还需要颜色状态；其余开关已移到菜单里
         self.caption_btn.configure(bg=ACCENT if self.caption_enabled else BTN_BG,
                                    fg="#fff" if self.caption_enabled else FG)
-        if hasattr(self, "ab_btn"):
-            self.ab_btn.configure(bg=ACCENT if self._ab_end_ms is not None else BTN_BG)
-            self.repeat_one_btn.configure(bg=ACCENT if self._repeat_one else BTN_BG)
-            self.repeat_list_btn.configure(bg=ACCENT if self._repeat_playlist else BTN_BG)
-            self.shuffle_btn.configure(bg=ACCENT if self._shuffle_playlist else BTN_BG)
         if hasattr(self, "cast_btn"):
             self.cast_btn.configure(
                 text="📺 投屏中" if self._cast_name else "📺 投屏",
@@ -2499,7 +2482,6 @@ class ComicViewer(tk.Tk):
             self.zoom_label.configure(text="画面 %d%%" % round(self._video_zoom * 100))
             self.zoom_out_btn.configure(state="normal")
             self.zoom_in_btn.configure(state="normal")
-            self.video_zoom_label.configure(text="画面 %d%%" % round(self._video_zoom * 100))
             self.status.configure(text=name + "   ·   视频   ·   画面 %d%%" % round(self._video_zoom * 100))
             return
         name = self._display_name(self.sources[self.index])
