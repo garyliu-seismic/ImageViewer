@@ -72,25 +72,6 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff",
 ZIP_EXTS = {".zip", ".cbz"}
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".wmv", ".flv", ".m4v", ".ts", ".mpg", ".mpeg", ".3gp"}
 
-# ---- VLC 投屏（renderer）事件解析 ----
-# python-vlc 3.0.x 自动生成的绑定里，Event.U.RendererDiscovererItemAdded 的
-# item 字段没被暴露（_fields_ 为空），导致事件回调里拿不到 renderer item 指针。
-# 这里按 libvlc_event_t 的真实内存布局手动解析出 item 指针：
-#   struct libvlc_event_t { int type; void *obj; union { struct { void *item; }
-#   renderer_discoverer_item_added; ... } u; }
-# 在 64 位 Windows 上 type 占 4 字节 + 4 字节对齐填充，obj 偏移 8，u 偏移 16；
-# renderer_discoverer_item_added 的 item 是 union 的第一个字段（偏移 0）。
-class _RendererItemAdded(ctypes.Structure):
-    _fields_ = [("item", ctypes.c_void_p)]
-
-
-class _RendererEventUnion(ctypes.Union):
-    _fields_ = [("renderer_discoverer_item_added", _RendererItemAdded)]
-
-
-class _RendererEvent(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_int), ("obj", ctypes.c_void_p), ("u", _RendererEventUnion)]
-
 CAPTION_LANGS = ["中文", "英文", "日语"]
 CAPTION_LANG_CODES = {"中文": "zh", "英文": "en", "日语": "ja"}
 CAPTION_MODES = ["原声", "中文翻译", "AI 翻译"]
@@ -222,12 +203,17 @@ class ComicViewer(tk.Tk):
         self._compare_mode = False     # 图片对比模式（两图并排）
         self._sub_load_guard = False   # _load_subtitle_for 内加载字幕时的重入保护
 
-        # 投屏（VLC renderer / DLNA / Chromecast）
-        self._cast_discoverer = None   # vlc.RendererDiscoverer 实例
-        self._cast_items = {}          # 设备名 -> vlc.Renderer（已 hold）
+        # 投屏（DLNA / Chromecast）
+        self._cast_items = {}          # 设备名 -> dlna_cast.DlnaRenderer
         self._cast_dialog = None       # 投屏设备选择窗口
         self._cast_listbox = None      # 设备列表控件
+        self._cast_status_label = None
         self._cast_name = None         # 当前投屏的设备名，None=本地播放
+        self._cast_mode = None         # None=本地播放, "dlna"=DLNA 投屏
+        self._dlna = None              # dlna_cast.DlnaRenderer
+        self._dlna_server = None       # dlna_cast.LocalMediaServer
+        self._dlna_playing = False     # DLNA 播放/暂停状态
+        self._dlna_total = 0           # DLNA 缓存的总时长（秒）
 
         self._build_ui()
         self._build_menu()
@@ -932,6 +918,8 @@ class ComicViewer(tk.Tk):
             self.zoom_center(0.8)
 
     def change_video_zoom(self, delta):
+        if self._cast_mode == "dlna":
+            return  # DLNA 投屏不支持画面缩放
         self._video_zoom = clamp(round(self._video_zoom + delta, 2), 0.5, 4.0)
         self._apply_video_zoom()
         self._save_video_options()
@@ -1065,6 +1053,9 @@ class ComicViewer(tk.Tk):
 
     def rate_change(self, delta):
         """+/− 快捷键：以步长调整播放速率（1:加快，-1:减慢）。"""
+        if self._cast_mode == "dlna":
+            self.status.configure(text="投屏模式不支持倍速（DLNA 限制）")
+            return
         self._run_rate(delta)
 
     def _choose_rate(self):
@@ -1142,7 +1133,7 @@ class ComicViewer(tk.Tk):
         if not self.is_video:
             self.status.configure(text="投屏仅在视频页可用：请先打开一个视频")
             return
-        if self._cast_name:
+        if self._cast_mode == "dlna":
             self._cancel_cast()
         elif self._cast_dialog is not None and self._cast_dialog.winfo_exists():
             self._cast_dialog.lift()
@@ -1184,7 +1175,7 @@ class ComicViewer(tk.Tk):
                   font=("Microsoft YaHei", 10)).pack(side="left", padx=2)
         self._cast_listbox.bind("<Double-Button-1>", lambda e: self._cast_select())
         dlg.protocol("WM_DELETE_WINDOW", self._close_cast_dialog)
-        self._start_cast_discovery()
+        self._cast_scan()
         # 约 6 秒后若仍无设备，提示常见原因，避免用户干等
         self.after(6000, self._cast_check_empty)
 
@@ -1201,7 +1192,6 @@ class ComicViewer(tk.Tk):
                 text="发现 %d 个设备，选中后点「投到选中设备」" % n)
 
     def _close_cast_dialog(self):
-        self._stop_cast_discovery()
         if self._cast_dialog is not None:
             try:
                 self._cast_dialog.destroy()
@@ -1211,119 +1201,31 @@ class ComicViewer(tk.Tk):
         self._cast_listbox = None
         self._cast_status_label = None
 
-    def _start_cast_discovery(self):
-        self._stop_cast_discovery()
-        if not self._ensure_vlc():
-            return
-        try:
-            self._cast_items.clear()
-            if self._cast_listbox is not None and self._cast_listbox.winfo_exists():
-                self._cast_listbox.delete(0, "end")
-            # microdns：VLC 3.x 内置的 mDNS/DLNA 渲染器发现服务（自动发现
-            # 局域网里的 Chromecast / DLNA 电视 / 小米盒子等）。
-            self._cast_discoverer = self.vlc_instance.renderer_discoverer_new("microdns")
-            if self._cast_discoverer is None:
-                self.status.configure(text="投屏：无法启动设备发现服务")
-                return
-            em = self._cast_discoverer.event_manager()
-            em.event_attach(self.vlc.EventType.RendererDiscovererItemAdded,
-                            self._on_cast_item_added)
-            em.event_attach(self.vlc.EventType.RendererDiscovererItemDeleted,
-                            self._on_cast_item_deleted)
-            self._cast_discoverer.start()
-        except Exception as e:
-            self.status.configure(text="投屏：设备发现失败 %s" % e)
-
-    def _stop_cast_discovery(self):
-        d = self._cast_discoverer
-        self._cast_discoverer = None
-        if d is not None:
-            try:
-                d.stop()
-            except Exception:
-                pass
-            try:
-                d.release()
-            except Exception:
-                pass
-        # 释放我们 hold 的 renderer item（正在投屏的那个 player 持有独立引用，
-        # 这里释放列表引用不影响播放）。用 list() 拷贝避免释放期间有后台事件
-        # 线程同时往 dict 里塞新设备导致迭代中变更。
-        for item in list(self._cast_items.values()):
-            try:
-                item.release()
-            except Exception:
-                pass
+    def _cast_scan(self):
+        """后台线程 SSDP 扫描 DLNA 渲染器（会阻塞几秒，不能放主线程）。"""
+        if self._cast_listbox is not None and self._cast_listbox.winfo_exists():
+            self._cast_listbox.delete(0, "end")
         self._cast_items.clear()
 
-    def _cast_item_ptr(self, event):
-        """从 ItemAdded/ItemDeleted 事件里取出 renderer item 指针。"""
-        try:
-            e = _RendererEvent.from_address(ctypes.addressof(event))
-            return e.u.renderer_discoverer_item_added.item
-        except Exception:
-            return None
+        def _scan():
+            try:
+                import dlna_cast
+                renderers = dlna_cast.discover_renderers(timeout=4)
+                for r in renderers:
+                    self._cast_items[r.name] = r
+                    self.after(0, self._cast_listbox_insert, r.name)
+            except Exception:
+                pass
 
-    @staticmethod
-    def _cast_item_name(item):
-        try:
-            name = item.name()
-        except Exception:
-            return None
-        if isinstance(name, bytes):
-            name = name.decode("utf-8", "replace")
-        return str(name) if name else None
-
-    def _on_cast_item_added(self, event):
-        ptr = self._cast_item_ptr(event)
-        if not ptr:
-            return
-        try:
-            item = self.vlc.Renderer(ptr)
-            item.hold()
-            name = self._cast_item_name(item)
-            if not name or name in self._cast_items:
-                item.release()
-                return
-            self._cast_items[name] = item
-            # 事件回调在 libvlc 后台线程触发，UI 更新必须调度回 Tk 主线程
-            self.after(0, self._cast_listbox_insert, name)
-        except Exception:
-            pass
+        threading.Thread(target=_scan, daemon=True).start()
 
     def _cast_listbox_insert(self, name):
         if self._cast_listbox is not None and self._cast_listbox.winfo_exists():
-            self._cast_listbox.insert("end", name)
-
-    def _on_cast_item_deleted(self, event):
-        ptr = self._cast_item_ptr(event)
-        if not ptr:
-            return
-        try:
-            item = self.vlc.Renderer(ptr)
-            name = self._cast_item_name(item)
-            if name and name in self._cast_items:
-                try:
-                    self._cast_items.pop(name).release()
-                except Exception:
-                    pass
-                self.after(0, self._cast_listbox_delete, name)
-        except Exception:
-            pass
-
-    def _cast_listbox_delete(self, name):
-        if self._cast_listbox is not None and self._cast_listbox.winfo_exists():
-            try:
-                names = self._cast_listbox.get(0, "end")
-                idx = list(names).index(name)
-                self._cast_listbox.delete(idx)
-            except Exception:
-                pass
+            if name not in self._cast_listbox.get(0, "end"):
+                self._cast_listbox.insert("end", name)
 
     def _cast_rescan(self):
-        if self._cast_listbox is not None and self._cast_listbox.winfo_exists():
-            self._cast_listbox.delete(0, "end")
-        self._start_cast_discovery()
+        self._cast_scan()
 
     def _cast_select(self):
         if self._cast_dialog is None or not self._cast_dialog.winfo_exists():
@@ -1332,43 +1234,117 @@ class ComicViewer(tk.Tk):
         if not sel:
             return
         name = self._cast_listbox.get(sel[0])
-        item = self._cast_items.get(name)
-        if item is None:
+        renderer = self._cast_items.get(name)
+        if renderer is None:
             return
-        self._apply_cast(item, name)
+        self._apply_cast(renderer, name)
         self._close_cast_dialog()
 
-    def _apply_cast(self, item, name=None):
-        """把当前视频投到指定设备；item 为 None 时取消投屏、恢复本地播放。
+    def _apply_cast(self, renderer, name=None):
+        """投屏到 DLNA 设备；renderer 为 None 时取消投屏、恢复本地播放。
 
-        set_renderer 需在 play() 之前设置才可靠生效，所以这里先走 _stop_video
-        （后台线程安全 stop，并自动保存续播点），设置渲染器后再重新打开视频，
-        重开后自动续播到原进度，实现无缝切换。
+        DLNA 投屏：停本地 VLC → 起本地 HTTP 服务器暴露视频 → SOAP
+        SetAVTransportURI + Play 把视频推给投影仪，之后播放/暂停/进度条
+        都通过 SOAP 控制投影仪，本地 VLC 不再参与。
         """
-        if not self.is_video or not self.player or self._video_is_stopping():
+        if renderer is None:
+            self._cast_stop()
+            self._cast_name = None
+            self._sync_toggle_buttons()
+            self._show_video(self.sources[self.index])
+            self.status.configure(text="已取消投屏，恢复本地播放")
+            return
+        if not self.is_video or not self.player:
             return
         src = self.sources[self.index]
-        self._stop_video()          # 安全停播 + 保存续播点
-        try:
-            self.player.set_renderer(item)
-        except Exception as e:
-            self.status.configure(text="投屏失败：%s" % e)
+        path = self._video_path(src)
+        if not path:
+            self.status.configure(text="投屏失败：无法读取视频文件")
             return
-        self._cast_name = name if item is not None else None
+        self._save_resume_position()
+        self._stop_video()
+        try:
+            import dlna_cast
+            srv = dlna_cast.LocalMediaServer(path)
+            url = srv.start()
+        except Exception as e:
+            self.status.configure(text="投屏失败（无法启动媒体服务）：%s" % e)
+            self._show_video(src)
+            return
+        try:
+            renderer.set_uri(url, self._display_name(src))
+            renderer.play()
+        except Exception as e:
+            try:
+                srv.stop()
+            except Exception:
+                pass
+            self.status.configure(text="投屏失败：%s" % e)
+            self._show_video(src)
+            return
+        self._dlna = renderer
+        self._dlna_server = srv
+        self._dlna_playing = True
+        self._dlna_total = 0
+        self._cast_name = name
+        self._cast_mode = "dlna"
+        self.is_video = True
+        self.play_btn.configure(text="⏸")
+        self._show_video_bar()
         self._sync_toggle_buttons()
-        self._show_video(src)
-        if item is not None:
-            self.status.configure(text="已投屏到：%s（字幕 / 冷门格式可能不跟投）" % name)
-        else:
-            self.status.configure(text="已取消投屏，恢复本地播放")
+        self._update_status()
+        self._update_video_time_loop()
+        self.status.configure(text="已投屏到：%s（播放/暂停/进度条控制投影仪）" % name)
+
+    def _cast_stop(self):
+        """停止 DLNA 投屏（stop + 关 HTTP 服务器），不恢复本地播放。"""
+        if self._dlna:
+            try:
+                self._dlna.stop()
+            except Exception:
+                pass
+            self._dlna = None
+        if self._dlna_server:
+            try:
+                self._dlna_server.stop()
+            except Exception:
+                pass
+            self._dlna_server = None
+        self._cast_mode = None
+        self._dlna_playing = False
+
+    def _save_dlna_position(self):
+        """把投影仪当前播放位置写入续播配置，供取消投屏后本地续播。"""
+        if not self._dlna or not self.sources:
+            return
+        try:
+            pos = self._dlna.get_position()
+            if pos and pos[0] > 1000:
+                key = self._video_resume_key(self.sources[self.index])
+                if key:
+                    self._config.setdefault("_video_resume_", {})[key] = pos[0]
+                    self._save_config()
+        except Exception:
+            pass
 
     def _cancel_cast(self):
+        self._save_dlna_position()
         self._apply_cast(None)
 
     def _stop_video(self):
         if self._video_timer:
             self.after_cancel(self._video_timer)
             self._video_timer = None
+        if self._cast_mode == "dlna":
+            # DLNA 投屏模式：保存投影仪位置，停 DLNA，不碰 VLC
+            self._save_dlna_position()
+            self._cast_stop()
+            self._cast_name = None
+            self._sync_toggle_buttons()
+            self.is_video = False
+            self._stop_captions()
+            self._hide_video_bar()
+            return
         # 先置位：_stop_player 会 pump Tk 事件，期间若有残留的 after 回调
         # （如 _refresh_video_hwnd / _update_video_time_loop）会因 is_video=False
         # 而直接返回，避免在后台 stop 进行中误触 player。
@@ -1445,6 +1421,21 @@ class ComicViewer(tk.Tk):
             self.update_idletasks()
 
     def _toggle_play(self):
+        if self._cast_mode == "dlna":
+            if not self._dlna:
+                return
+            try:
+                if self._dlna_playing:
+                    self._dlna.pause()
+                    self._dlna_playing = False
+                    self.play_btn.configure(text="▶")
+                else:
+                    self._dlna.play()
+                    self._dlna_playing = True
+                    self.play_btn.configure(text="⏸")
+            except Exception:
+                pass
+            return
         if not self.player or not self.is_video or self._video_is_stopping():
             return
         try:
@@ -1461,6 +1452,13 @@ class ComicViewer(tk.Tk):
         if self._updating_seek:
             return
         self._last_seek = time.time()
+        if self._cast_mode == "dlna":
+            if self._dlna and self._dlna_total > 0:
+                try:
+                    self._dlna.seek(int(float(val) / 1000.0 * self._dlna_total))
+                except Exception:
+                    pass
+            return
         if not self.player or not self.is_video or self._video_is_stopping():
             return
         try:
@@ -1473,6 +1471,8 @@ class ComicViewer(tk.Tk):
             pass
 
     def _on_volume(self, val):
+        if self._cast_mode == "dlna":
+            return  # DLNA 音量由投影仪控制
         if self.player and not self._video_is_stopping():
             try:
                 self.player.audio_set_volume(int(float(val)))
@@ -1481,6 +1481,9 @@ class ComicViewer(tk.Tk):
 
     def _update_video_time_loop(self):
         self._video_timer = None
+        if self._cast_mode == "dlna":
+            self._update_dlna_time_loop()
+            return
         if not self.is_video or not self.player or self._video_is_stopping():
             return
         try:
@@ -1517,7 +1520,37 @@ class ComicViewer(tk.Tk):
         except Exception:
             pass
 
+    def _update_dlna_time_loop(self):
+        """DLNA 投屏模式下的进度条轮询（1Hz）。"""
+        self._video_timer = None
+        if self._cast_mode != "dlna" or not self._dlna or not self.is_video:
+            return
+        try:
+            pos = self._dlna.get_position()
+            if pos:
+                cur, total, _state = pos
+                if total > 0:
+                    self._dlna_total = total
+                    self.time_label.configure(
+                        text="%s / %s" % (self._fmt_time(cur), self._fmt_time(total)))
+                    if time.time() - self._last_seek > 0.5:
+                        self._updating_seek = True
+                        try:
+                            self.seek.set(cur / total * 1000.0)
+                        finally:
+                            self._updating_seek = False
+        except Exception:
+            pass
+        self._video_timer = self.after(1000, self._update_dlna_time_loop)
+        try:
+            self.rate_label.configure(text="%.1f\u00d7" % self._rate)
+        except Exception:
+            pass
+
     def toggle_captions(self):
+        if self._cast_mode == "dlna":
+            self.status.configure(text="投屏模式下本地字幕不跟投（DLNA 限制）")
+            return
         self.caption_enabled = not self.caption_enabled
         self._sync_toggle_buttons()
         if self.is_video:
