@@ -214,6 +214,8 @@ class ComicViewer(tk.Tk):
         self._dlna_server = None       # dlna_cast.LocalMediaServer
         self._dlna_playing = False     # DLNA 播放/暂停状态
         self._dlna_total = 0           # DLNA 缓存的总时长（秒）
+        self._dlna_pos = 0             # 本地计时的当前秒数
+        self._dlna_sync_tick = 0       # 校准计数器
 
         self._build_ui()
         self._build_menu()
@@ -1286,6 +1288,8 @@ class ComicViewer(tk.Tk):
         self._dlna_server = srv
         self._dlna_playing = True
         self._dlna_total = 0
+        self._dlna_pos = 0
+        self._dlna_sync_tick = 0
         self._cast_name = name
         self._cast_mode = "dlna"
         self.is_video = True
@@ -1455,7 +1459,9 @@ class ComicViewer(tk.Tk):
         if self._cast_mode == "dlna":
             if self._dlna and self._dlna_total > 0:
                 try:
-                    self._dlna.seek(int(float(val) / 1000.0 * self._dlna_total))
+                    target = int(float(val) / 1000.0 * self._dlna_total)
+                    self._dlna_pos = target
+                    self._dlna.seek(target)
                 except Exception:
                     pass
             return
@@ -1521,24 +1527,36 @@ class ComicViewer(tk.Tk):
             pass
 
     def _update_dlna_time_loop(self):
-        """DLNA 投屏模式下的进度条轮询（1Hz）。"""
+        """DLNA 投屏模式下的进度条轮询（1Hz，本地计时 + 定期校准）。
+
+        极米的 GetPositionInfo 响应不稳定（实测 8 秒后经常超时返回 None），
+        所以不能用它每秒更新进度条；改为本地计时每秒 +1，每 5 秒向投影仪
+        校准一次，兼顾流畅与准确。
+        """
         self._video_timer = None
         if self._cast_mode != "dlna" or not self._dlna or not self.is_video:
             return
         try:
-            pos = self._dlna.get_position()
-            if pos:
-                cur, total, _state = pos
-                if total > 0:
-                    self._dlna_total = total
-                    self.time_label.configure(
-                        text="%s / %s" % (self._fmt_time(cur), self._fmt_time(total)))
-                    if time.time() - self._last_seek > 0.5:
-                        self._updating_seek = True
-                        try:
-                            self.seek.set(cur / total * 1000.0)
-                        finally:
-                            self._updating_seek = False
+            if self._dlna_playing:
+                self._dlna_pos += 1
+            self._dlna_sync_tick += 1
+            if self._dlna_sync_tick >= 5:
+                self._dlna_sync_tick = 0
+                pos = self._dlna.get_position()
+                if pos:
+                    self._dlna_pos, total, _state = pos
+                    if total > 0:
+                        self._dlna_total = total
+            if self._dlna_total > 0:
+                cur = min(self._dlna_pos, self._dlna_total)
+                self.time_label.configure(
+                    text="%s / %s" % (self._fmt_time(cur), self._fmt_time(self._dlna_total)))
+                if time.time() - self._last_seek > 0.5:
+                    self._updating_seek = True
+                    try:
+                        self.seek.set(cur / self._dlna_total * 1000.0)
+                    finally:
+                        self._updating_seek = False
         except Exception:
             pass
         self._video_timer = self.after(1000, self._update_dlna_time_loop)
