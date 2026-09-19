@@ -72,6 +72,25 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff",
 ZIP_EXTS = {".zip", ".cbz"}
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".wmv", ".flv", ".m4v", ".ts", ".mpg", ".mpeg", ".3gp"}
 
+# ---- VLC 投屏（renderer）事件解析 ----
+# python-vlc 3.0.x 自动生成的绑定里，Event.U.RendererDiscovererItemAdded 的
+# item 字段没被暴露（_fields_ 为空），导致事件回调里拿不到 renderer item 指针。
+# 这里按 libvlc_event_t 的真实内存布局手动解析出 item 指针：
+#   struct libvlc_event_t { int type; void *obj; union { struct { void *item; }
+#   renderer_discoverer_item_added; ... } u; }
+# 在 64 位 Windows 上 type 占 4 字节 + 4 字节对齐填充，obj 偏移 8，u 偏移 16；
+# renderer_discoverer_item_added 的 item 是 union 的第一个字段（偏移 0）。
+class _RendererItemAdded(ctypes.Structure):
+    _fields_ = [("item", ctypes.c_void_p)]
+
+
+class _RendererEventUnion(ctypes.Union):
+    _fields_ = [("renderer_discoverer_item_added", _RendererItemAdded)]
+
+
+class _RendererEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("obj", ctypes.c_void_p), ("u", _RendererEventUnion)]
+
 CAPTION_LANGS = ["中文", "英文", "日语"]
 CAPTION_LANG_CODES = {"中文": "zh", "英文": "en", "日语": "ja"}
 CAPTION_MODES = ["原声", "中文翻译", "AI 翻译"]
@@ -203,6 +222,13 @@ class ComicViewer(tk.Tk):
         self._compare_mode = False     # 图片对比模式（两图并排）
         self._sub_load_guard = False   # _load_subtitle_for 内加载字幕时的重入保护
 
+        # 投屏（VLC renderer / DLNA / Chromecast）
+        self._cast_discoverer = None   # vlc.RendererDiscoverer 实例
+        self._cast_items = {}          # 设备名 -> vlc.Renderer（已 hold）
+        self._cast_dialog = None       # 投屏设备选择窗口
+        self._cast_listbox = None      # 设备列表控件
+        self._cast_name = None         # 当前投屏的设备名，None=本地播放
+
         self._build_ui()
         self._build_menu()
         self._bind_events()
@@ -323,6 +349,7 @@ class ComicViewer(tk.Tk):
             self.video_bar,
             "字幕位置: " + ("顶部" if self.caption_pos == "top" else "底部"),
             self.toggle_caption_pos)
+        self.cast_btn = self._state_btn(self.video_bar, "📺 投屏", self.toggle_cast)
 
         # VLC 硬件加速（D3D11）在 video_panel 的原生窗口上直接画视频画面，会盖住
         # 任何叠在它上面的 Tk 子控件 -- Tk 的 lift()/z-order 对这种系统合成层面
@@ -383,6 +410,8 @@ class ComicViewer(tk.Tk):
         view.add_command(label="下一轨（播放列表）", command=self._playlist_forward)
         view.add_command(label="上一轨（播放列表）", command=self._playlist_back)
         view.add_command(label="图片对比模式（两图并排）", command=self.toggle_compare)
+        view.add_separator()
+        view.add_command(label="投屏到电视 / 设备", command=self.toggle_cast)
         menubar.add_cascade(label="视图", menu=view)
 
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -503,6 +532,7 @@ class ComicViewer(tk.Tk):
 
     def _on_close(self):
         self._cancel_auto()
+        self._close_cast_dialog()
         self._stop_video()
         self._save_progress()
         self._close_zip()
@@ -1122,6 +1152,219 @@ class ComicViewer(tk.Tk):
         self.sources = list(self._playlist)
         self._playlist_index0 = self._playlist.index(src)
         self.show_file(self._playlist_index0)
+
+    # ---------------- 投屏（DLNA / Chromecast） -------------
+    def toggle_cast(self):
+        """投屏按钮：打开设备选择 / 取消当前投屏。"""
+        if not self.is_video:
+            self.status.configure(text="投屏仅在视频页可用：请先打开一个视频")
+            return
+        if self._cast_name:
+            self._cancel_cast()
+        elif self._cast_dialog is not None and self._cast_dialog.winfo_exists():
+            self._cast_dialog.lift()
+            self._cast_dialog.focus_force()
+        else:
+            self._open_cast_dialog()
+
+    def _open_cast_dialog(self):
+        if self._cast_dialog is not None and self._cast_dialog.winfo_exists():
+            self._cast_dialog.destroy()
+        dlg = tk.Toplevel(self)
+        dlg.title("投屏 - 选择设备")
+        dlg.configure(bg=PANEL)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        self._cast_dialog = dlg
+
+        tk.Label(dlg, text="正在搜索局域网里的投屏设备…", bg=PANEL, fg=FG,
+                 font=("Microsoft YaHei", 10)).pack(padx=16, pady=(12, 4), anchor="w")
+        self._cast_listbox = tk.Listbox(dlg, width=44, height=9, bg=BG, fg=FG,
+                                        selectbackground=ACCENT, selectforeground="#fff",
+                                        relief="flat", bd=0, font=("Microsoft YaHei", 11),
+                                        highlightthickness=0, activestyle="none")
+        self._cast_listbox.pack(padx=16, pady=4, fill="both", expand=True)
+        btns = tk.Frame(dlg, bg=PANEL)
+        btns.pack(padx=16, pady=(0, 12), fill="x")
+        tk.Button(btns, text="投到选中设备", command=self._cast_select, takefocus=0,
+                  bg=ACCENT, fg="#fff", activebackground="#5b9aff", activeforeground="#fff",
+                  relief="flat", bd=0, padx=12, pady=5, cursor="hand2",
+                  font=("Microsoft YaHei", 10)).pack(side="left", padx=2)
+        tk.Button(btns, text="刷新", command=self._cast_rescan, takefocus=0,
+                  bg=BTN_BG, fg=FG, activebackground=BTN_ACTIVE, activeforeground="#fff",
+                  relief="flat", bd=0, padx=12, pady=5, cursor="hand2",
+                  font=("Microsoft YaHei", 10)).pack(side="left", padx=2)
+        tk.Button(btns, text="取消", command=self._close_cast_dialog, takefocus=0,
+                  bg=BTN_BG, fg=FG, activebackground=BTN_ACTIVE, activeforeground="#fff",
+                  relief="flat", bd=0, padx=12, pady=5, cursor="hand2",
+                  font=("Microsoft YaHei", 10)).pack(side="left", padx=2)
+        self._cast_listbox.bind("<Double-Button-1>", lambda e: self._cast_select())
+        dlg.protocol("WM_DELETE_WINDOW", self._close_cast_dialog)
+        self._start_cast_discovery()
+
+    def _close_cast_dialog(self):
+        self._stop_cast_discovery()
+        if self._cast_dialog is not None:
+            try:
+                self._cast_dialog.destroy()
+            except Exception:
+                pass
+            self._cast_dialog = None
+        self._cast_listbox = None
+
+    def _start_cast_discovery(self):
+        self._stop_cast_discovery()
+        if not self._ensure_vlc():
+            return
+        try:
+            self._cast_items.clear()
+            if self._cast_listbox is not None and self._cast_listbox.winfo_exists():
+                self._cast_listbox.delete(0, "end")
+            # microdns：VLC 3.x 内置的 mDNS/DLNA 渲染器发现服务（自动发现
+            # 局域网里的 Chromecast / DLNA 电视 / 小米盒子等）。
+            self._cast_discoverer = self.vlc_instance.renderer_discoverer_new("microdns")
+            if self._cast_discoverer is None:
+                self.status.configure(text="投屏：无法启动设备发现服务")
+                return
+            em = self._cast_discoverer.event_manager()
+            em.event_attach(self.vlc.EventType.RendererDiscovererItemAdded,
+                            self._on_cast_item_added)
+            em.event_attach(self.vlc.EventType.RendererDiscovererItemDeleted,
+                            self._on_cast_item_deleted)
+            self._cast_discoverer.start()
+        except Exception as e:
+            self.status.configure(text="投屏：设备发现失败 %s" % e)
+
+    def _stop_cast_discovery(self):
+        d = self._cast_discoverer
+        self._cast_discoverer = None
+        if d is not None:
+            try:
+                d.stop()
+            except Exception:
+                pass
+            try:
+                d.release()
+            except Exception:
+                pass
+        # 释放我们 hold 的 renderer item（正在投屏的那个 player 持有独立引用，
+        # 这里释放列表引用不影响播放）。用 list() 拷贝避免释放期间有后台事件
+        # 线程同时往 dict 里塞新设备导致迭代中变更。
+        for item in list(self._cast_items.values()):
+            try:
+                item.release()
+            except Exception:
+                pass
+        self._cast_items.clear()
+
+    def _cast_item_ptr(self, event):
+        """从 ItemAdded/ItemDeleted 事件里取出 renderer item 指针。"""
+        try:
+            e = _RendererEvent.from_address(ctypes.addressof(event))
+            return e.u.renderer_discoverer_item_added.item
+        except Exception:
+            return None
+
+    @staticmethod
+    def _cast_item_name(item):
+        try:
+            name = item.name()
+        except Exception:
+            return None
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", "replace")
+        return str(name) if name else None
+
+    def _on_cast_item_added(self, event):
+        ptr = self._cast_item_ptr(event)
+        if not ptr:
+            return
+        try:
+            item = self.vlc.Renderer(ptr)
+            item.hold()
+            name = self._cast_item_name(item)
+            if not name or name in self._cast_items:
+                item.release()
+                return
+            self._cast_items[name] = item
+            # 事件回调在 libvlc 后台线程触发，UI 更新必须调度回 Tk 主线程
+            self.after(0, self._cast_listbox_insert, name)
+        except Exception:
+            pass
+
+    def _cast_listbox_insert(self, name):
+        if self._cast_listbox is not None and self._cast_listbox.winfo_exists():
+            self._cast_listbox.insert("end", name)
+
+    def _on_cast_item_deleted(self, event):
+        ptr = self._cast_item_ptr(event)
+        if not ptr:
+            return
+        try:
+            item = self.vlc.Renderer(ptr)
+            name = self._cast_item_name(item)
+            if name and name in self._cast_items:
+                try:
+                    self._cast_items.pop(name).release()
+                except Exception:
+                    pass
+                self.after(0, self._cast_listbox_delete, name)
+        except Exception:
+            pass
+
+    def _cast_listbox_delete(self, name):
+        if self._cast_listbox is not None and self._cast_listbox.winfo_exists():
+            try:
+                names = self._cast_listbox.get(0, "end")
+                idx = list(names).index(name)
+                self._cast_listbox.delete(idx)
+            except Exception:
+                pass
+
+    def _cast_rescan(self):
+        if self._cast_listbox is not None and self._cast_listbox.winfo_exists():
+            self._cast_listbox.delete(0, "end")
+        self._start_cast_discovery()
+
+    def _cast_select(self):
+        if self._cast_dialog is None or not self._cast_dialog.winfo_exists():
+            return
+        sel = self._cast_listbox.curselection()
+        if not sel:
+            return
+        name = self._cast_listbox.get(sel[0])
+        item = self._cast_items.get(name)
+        if item is None:
+            return
+        self._apply_cast(item, name)
+        self._close_cast_dialog()
+
+    def _apply_cast(self, item, name=None):
+        """把当前视频投到指定设备；item 为 None 时取消投屏、恢复本地播放。
+
+        set_renderer 需在 play() 之前设置才可靠生效，所以这里先走 _stop_video
+        （后台线程安全 stop，并自动保存续播点），设置渲染器后再重新打开视频，
+        重开后自动续播到原进度，实现无缝切换。
+        """
+        if not self.is_video or not self.player or self._video_is_stopping():
+            return
+        src = self.sources[self.index]
+        self._stop_video()          # 安全停播 + 保存续播点
+        try:
+            self.player.set_renderer(item)
+        except Exception as e:
+            self.status.configure(text="投屏失败：%s" % e)
+            return
+        self._cast_name = name if item is not None else None
+        self._sync_toggle_buttons()
+        self._show_video(src)
+        if item is not None:
+            self.status.configure(text="已投屏到：%s（字幕 / 冷门格式可能不跟投）" % name)
+        else:
+            self.status.configure(text="已取消投屏，恢复本地播放")
+
+    def _cancel_cast(self):
+        self._apply_cast(None)
 
     def _stop_video(self):
         if self._video_timer:
@@ -1765,6 +2008,11 @@ class ComicViewer(tk.Tk):
             self.repeat_one_btn.configure(bg=ACCENT if self._repeat_one else BTN_BG)
             self.repeat_list_btn.configure(bg=ACCENT if self._repeat_playlist else BTN_BG)
             self.shuffle_btn.configure(bg=ACCENT if self._shuffle_playlist else BTN_BG)
+        if hasattr(self, "cast_btn"):
+            self.cast_btn.configure(
+                text="📺 投屏中" if self._cast_name else "📺 投屏",
+                bg=ACCENT if self._cast_name else BTN_BG,
+                fg="#fff" if self._cast_name else FG)
 
     def _play_next_at_end(self):
         if self._repeat_one:
