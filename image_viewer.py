@@ -68,6 +68,11 @@ except ImportError:
     print("缺少 Pillow 库，请先安装： pip install Pillow")
     sys.exit(1)
 
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".avif", ".jfif"}
 ZIP_EXTS = {".zip", ".cbz"}
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".wmv", ".flv", ".m4v", ".ts", ".mpg", ".mpeg", ".3gp"}
@@ -84,6 +89,10 @@ HISTORY_LIMIT = 100
 RATE_OPTS = ["0.5", "0.75", "1.0", "1.25", "1.5", "2.0", "2.5", "3.0", "4.0",
              "5.0", "6.0", "8.0", "10.0", "12.0", "15.0", "20.0", "30.0",
              "40.0", "50.0", "60.0"]
+
+# 视频截图：抓取最近 N 帧做亚像素对齐 + 堆叠超分，合并成一张更清晰的高清图
+SCREENSHOT_FRAMES = 5
+SCREENSHOT_MAX_EDGE = 4096   # 合成图长边上限，避免 4K 源翻倍后内存/文件过大
 
 
 def _is_same_subtitle(a: str, b: str) -> bool:
@@ -115,6 +124,100 @@ def natural_key(s):
 
 def clamp(v, a, b):
     return min(max(v, a), b)
+
+
+def _register_shift(ref_gray, frm_gray):
+    """用相位相关估算 frm 相对 ref 的亚像素平移 (dx, dy)（单位：像素）。
+
+    ref_gray / frm_gray 为 float 灰度图，尺寸相同。返回的 (dx, dy) 表示
+    frm(x, y) ≈ ref(x - dx, y - dy)，即 frm 的内容相对 ref 移动了 (dx, dy)。
+    """
+    if np is None:
+        return 0.0, 0.0
+    a = ref_gray.astype(np.float32)
+    b = frm_gray.astype(np.float32)
+    h, w = a.shape
+    # 轻量窗口，抑制 FFT 周期边界带来的伪影，让相关峰更干净
+    wy = np.hanning(h).astype(np.float32)[:, None]
+    wx = np.hanning(w).astype(np.float32)[None, :]
+    win = np.sqrt(wy * wx)
+    fa = np.fft.fft2(a * win)
+    fb = np.fft.fft2(b * win)
+    r = fa * np.conj(fb)
+    r /= (np.abs(r) + 1e-12)
+    corr = np.abs(np.fft.fftshift(np.fft.ifft2(r)))
+    cy, cx = np.unravel_index(int(np.argmax(corr)), corr.shape)
+    idy = float(h // 2 - cy)
+    idx = float(w // 2 - cx)
+    # 峰值处做抛物线插值，得到亚像素精度（峰值须在内部）
+    if 0 < cy < h - 1:
+        d = corr[cy - 1, cx] - 2.0 * corr[cy, cx] + corr[cy + 1, cx]
+        if abs(d) > 1e-12:
+            idy -= 0.5 * (corr[cy - 1, cx] - corr[cy + 1, cx]) / d
+    if 0 < cx < w - 1:
+        d = corr[cy, cx - 1] - 2.0 * corr[cy, cx] + corr[cy, cx + 1]
+        if abs(d) > 1e-12:
+            idx -= 0.5 * (corr[cy, cx - 1] - corr[cy, cx + 1]) / d
+    return float(idx), float(idy)
+
+
+def _merge_frames(frames, scale=2):
+    """把多帧做亚像素对齐后堆叠超分，输出一张 scale 倍分辨率的 RGB float 图。
+
+    frames：等尺寸的 float32 RGB numpy 数组列表，第一帧作为参考帧。
+    相邻帧通常只差几像素，用相位相关估算平移；再用 shift-and-add 把每帧的
+    亚像素采样落到高分辨率网格上，平均后得到更清晰、噪声更少的合成图。
+    """
+    n = len(frames)
+    ref = frames[0]
+    h, w, c = ref.shape
+
+    def _lum(a):
+        return (0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2]).astype(np.float32)
+
+    if n == 1 or np is None:
+        return np.repeat(np.repeat(ref, scale, axis=0), scale, axis=1)
+
+    refg = _lum(ref)
+    shifts = [(0.0, 0.0)]
+    for f in frames[1:]:
+        shifts.append(_register_shift(refg, _lum(f)))
+
+    out_h, out_w = h * scale, w * scale
+    acc = np.zeros((out_h, out_w, 3), np.float32)
+    wsum = np.zeros((out_h, out_w), np.float32)
+    # 输出像素中心对应到参考帧坐标
+    yy = (np.arange(out_h, dtype=np.float32) + 0.5) / scale
+    xx = (np.arange(out_w, dtype=np.float32) + 0.5) / scale
+    wy = np.hanning(h).astype(np.float32)
+    wx = np.hanning(w).astype(np.float32)
+    for f, (dx, dy) in zip(frames, shifts):
+        # 源帧的软边界权重：越靠边权重越低（移出画面的部分不可信），加底值避免零权重
+        wsrc = 0.2 + 0.8 * np.sqrt(wy[:, None] * wx[None, :])
+        tile = 256
+        for y0 in range(0, out_h, tile):
+            y1 = min(y0 + tile, out_h)
+            sy = yy[y0:y1, None] + dy
+            sx = xx[None, :] + dx
+            yf = np.floor(sy)
+            xf = np.floor(sx)
+            fy = (sy - yf).astype(np.float32)
+            fx = (sx - xf).astype(np.float32)
+            y0i = np.clip(yf.astype(np.int64), 0, h - 1)
+            x0i = np.clip(xf.astype(np.int64), 0, w - 1)
+            y1i = np.clip(y0i + 1, 0, h - 1)
+            x1i = np.clip(x0i + 1, 0, w - 1)
+            wgt = (wsrc[y0i, x0i] * (1 - fy) * (1 - fx)
+                   + wsrc[y0i, x1i] * (1 - fy) * fx
+                   + wsrc[y1i, x0i] * fy * (1 - fx)
+                   + wsrc[y1i, x1i] * fy * fx)
+            val = (f[y0i, x0i] * ((1 - fy) * (1 - fx))[..., None]
+                   + f[y0i, x1i] * ((1 - fy) * fx)[..., None]
+                   + f[y1i, x0i] * (fy * (1 - fx))[..., None]
+                   + f[y1i, x1i] * (fy * fx)[..., None])
+            acc[y0:y1] += val * wgt[..., None]
+            wsum[y0:y1] += wgt
+    return acc / np.maximum(wsum, 1e-6)[..., None]
 
 
 class ComicViewer(tk.Tk):
@@ -172,6 +275,7 @@ class ComicViewer(tk.Tk):
         self._video_timer = None
         self._stop_event = None  # 后台线程 stop() 的完成信号（见 _stop_player）
         self._video_ended = False
+        self._screenshot_busy = False  # 视频截图进行中（防止重入）
         self._last_seek = 0.0
         self._updating_seek = False
         self._resume_seek_ms = None
@@ -315,6 +419,7 @@ class ComicViewer(tk.Tk):
         self.caption_mode_combo.pack(side="left", padx=2)
         self.caption_mode_combo.bind("<<ComboboxSelected>>", self._on_caption_mode_change)
         self.cast_btn = self._state_btn(self.video_bar, "📺 投屏", self.toggle_cast)
+        self.shot_btn = self._state_btn(self.video_bar, "📷 截图", self._video_screenshot)
 
         # VLC 硬件加速（D3D11）在 video_panel 的原生窗口上直接画视频画面，会盖住
         # 任何叠在它上面的 Tk 子控件 -- Tk 的 lift()/z-order 对这种系统合成层面
@@ -383,6 +488,8 @@ class ComicViewer(tk.Tk):
         view.add_command(label="字幕位置 顶部/底部", command=self.toggle_caption_pos)
         view.add_separator()
         view.add_command(label="投屏到电视 / 设备", command=self.toggle_cast)
+        view.add_separator()
+        view.add_command(label="视频截图（多帧合成高清）", command=self._video_screenshot, accelerator="P")
         menubar.add_cascade(label="视图", menu=view)
 
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -1485,6 +1592,158 @@ class ComicViewer(tk.Tk):
             except Exception:
                 pass
 
+    def _pump(self, seconds):
+        """在视频截图期间持续泵 Tk 事件，让 VLC 渲染线程有机会出帧。"""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            try:
+                self.update()
+            except Exception:
+                pass
+            time.sleep(0.01)
+
+    def _screenshot_path(self):
+        """决定截图保存位置：本地视频存同目录「截图」文件夹；压缩包内视频存
+        用户图片目录下的「视频截图」。"""
+        src = self.sources[self.index]
+        name = self._display_name(src)
+        stem = os.path.splitext(name)[0] or "video"
+        if isinstance(src, tuple) or not os.path.dirname(src):
+            base = os.path.join(os.path.expanduser("~"), "Pictures", "视频截图")
+        else:
+            base = os.path.join(os.path.dirname(src), "截图")
+        try:
+            os.makedirs(base, exist_ok=True)
+        except Exception:
+            base = self._tmp_dir
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        out = os.path.join(base, "%s_%s.png" % (stem, ts))
+        i = 1
+        while os.path.exists(out):
+            out = os.path.join(base, "%s_%s_%d.png" % (stem, ts, i))
+            i += 1
+        return out
+
+    def _video_screenshot(self):
+        """视频截图：抓取最近 N 帧，亚像素对齐后合并成一张更清晰的高清图。"""
+        if not self.is_video or not self.player or self._video_is_stopping():
+            self.status.configure(text="截图仅在视频页可用：请先打开一个视频")
+            return
+        if self._cast_mode == "dlna":
+            self.status.configure(text="投屏模式不支持本地截图")
+            return
+        if self._screenshot_busy:
+            return
+        self._screenshot_busy = True
+        self.status.configure(text="正在合成截图…")
+        self.update_idletasks()
+        try:
+            was_playing = False
+            try:
+                was_playing = bool(self.player.is_playing())
+            except Exception:
+                pass
+            if was_playing:
+                try:
+                    self.player.pause()
+                    self.play_btn.configure(text="▶")
+                except Exception:
+                    pass
+            try:
+                cur = self.player.get_time()
+                length = self.player.get_length()
+            except Exception:
+                cur, length = 0, 0
+            try:
+                fps = float(self.player.get_fps() or 0.0)
+            except Exception:
+                fps = 0.0
+            # 相邻帧间隔：约一帧，保证抓到的几帧确实不同、又有亚像素运动信息
+            offset_ms = max(20, int(round(1000.0 / fps))) if fps > 0 else 40
+
+            frames = []
+            for i in range(SCREENSHOT_FRAMES):
+                t = max(0, cur - i * offset_ms)
+                if length > 0:
+                    t = min(t, max(0, length - 120))
+                try:
+                    self.player.set_time(int(t))
+                except Exception:
+                    pass
+                self._pump(0.15)
+                tmp = os.path.join(self._tmp_dir, "shot_%d.png" % i)
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                try:
+                    ok = self.player.video_take_snapshot(0, tmp, 0, 0)
+                except Exception:
+                    ok = -1
+                # snapshot 写入可能异步，短暂等待后重试读取
+                if ok == 0:
+                    for _ in range(20):
+                        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                            break
+                        self._pump(0.02)
+                try:
+                    if ok == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                        im = Image.open(tmp).convert("RGB")
+                        if np is None:
+                            if not frames:
+                                frames.append(im)
+                            continue
+                        arr = np.asarray(im, dtype=np.float32)
+                        if frames and arr.shape != frames[0].shape:
+                            continue
+                        frames.append(arr)
+                except Exception:
+                    pass
+
+            # 恢复原来的播放位置与状态
+            try:
+                self.player.set_time(int(cur))
+            except Exception:
+                pass
+            if was_playing:
+                try:
+                    self.player.play()
+                    self.play_btn.configure(text="⏸")
+                except Exception:
+                    pass
+
+            if not frames:
+                self.status.configure(text="截图失败：未能从视频抓取画面")
+                return
+            if np is None:
+                # 未安装 numpy：退化为保存单帧截图
+                img = frames[0]
+            else:
+                # 长边翻倍超过上限时退化为原生分辨率合成，避免 8K 内存/文件过大
+                h, w = frames[0].shape[:2]
+                scale = 2 if (2 * max(h, w) <= SCREENSHOT_MAX_EDGE) else 1
+                merged = _merge_frames(frames, scale=scale)
+                img = Image.fromarray(np.clip(merged, 0, 255).astype(np.uint8), "RGB")
+            out = self._screenshot_path()
+            img.save(out)
+            self.status.configure(text="已截图：%s" % out)
+            self._notify_screenshot(out)
+        finally:
+            self._screenshot_busy = False
+
+    def _notify_screenshot(self, out):
+        try:
+            if messagebox.askyesno("截图完成", "已保存：%s\n\n是否打开所在文件夹？" % out, parent=self):
+                folder = os.path.dirname(out)
+                if sys.platform.startswith("win"):
+                    os.startfile(folder)
+                else:
+                    import subprocess
+                    subprocess.Popen(["xdg-open", folder])
+        except Exception:
+            pass
+
     def _update_video_time_loop(self):
         self._video_timer = None
         if self._cast_mode == "dlna":
@@ -2348,6 +2607,9 @@ class ComicViewer(tk.Tk):
         elif k in ("s", "S"):
             if self.is_video:
                 self._choose_subtitle()
+        elif k in ("p", "P", "Print"):
+            if self.is_video:
+                self._video_screenshot()
         elif k in ("a", "A"):
             self.toggle_auto()
         elif k == "bracketleft":
@@ -2585,6 +2847,7 @@ class ComicViewer(tk.Tk):
             "点击画面中间                    显示 / 隐藏工具栏\n"
             "双击画面中间                    适应窗口 <-> 实际大小\n"
             "视频页：空格 / 点击画面中间      播放 / 暂停\n"
+            "视频页：P / 截图按钮             截图（多帧合成，更清晰）\n"
             "视频页：播放完自动              跳到下一张\n"
             "R / Shift+R                    顺时针 / 逆时针旋转 90°\n"
             "0 / 1 / 2 / 3                  适应窗口 / 实际大小 / 适应宽度 / 适应高度\n"
