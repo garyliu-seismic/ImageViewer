@@ -13,6 +13,7 @@ __pycache__/
 # 打包输出
 build/
 dist/
+发布/
 
 # 编辑器 / 系统杂物
 .vscode/

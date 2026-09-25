@@ -73,8 +73,14 @@ try:
 except ImportError:
     np = None
 
+try:
+    import pymupdf as fitz  # PyMuPDF，用于读取 PDF 漫画
+except ImportError:
+    fitz = None
+
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".avif", ".jfif"}
 ZIP_EXTS = {".zip", ".cbz"}
+PDF_EXTS = {".pdf"}
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".wmv", ".flv", ".m4v", ".ts", ".mpg", ".mpeg", ".3gp"}
 
 CAPTION_LANGS = ["中文", "英文", "日语"]
@@ -227,7 +233,9 @@ class ComicViewer(tk.Tk):
         self.geometry("1250x820")
         self.configure(bg=BG)
 
-        self.sources = []          # 页面来源：路径(str) 或 (压缩包路径, 条目名)
+        self.sources = []          # 页面来源：路径(str)、压缩包条目(路径, 条目名) 或 PDF 页(路径, 页码)
+        self._chapters = None      # 章节：[{"title": str, "sources": list}]；None 表示无章节
+        self._chapter_index = 0
         self.index = -1
         self.rotation = 0
         self.zoom = 1.0
@@ -242,6 +250,8 @@ class ComicViewer(tk.Tk):
         self._auto_after = None
         self._spread_img = None    # 双页合成图（None 表示单页）
         self._zip = None           # 当前打开的压缩包
+        self._pdf_doc = None       # 当前打开的 PDF 文档（PyMuPDF）
+        self._pdf_path = None      # 当前 PDF 文档的路径
         self.book_key = None       # 断点续读的书籍标识
         self._config = self._load_config()
 
@@ -305,6 +315,8 @@ class ComicViewer(tk.Tk):
         self._playlist = []
         self._playlist_index0 = None   # 播放列表里的起始索引
         self._compare_mode = False     # 图片对比模式（两图并排）
+        self.book_filter = False       # 模拟纸质书质感（纸张纹理/书脊/光影）
+        self._grain_tile = None        # 纸张纹理噪声缓存
         self._sub_load_guard = False   # _load_subtitle_for 内加载字幕时的重入保护
 
         # 投屏（DLNA / Chromecast）
@@ -361,6 +373,15 @@ class ComicViewer(tk.Tk):
         self._sep(self.toolbar)
         self._btn(self.toolbar, "⛶ 全屏", self.toggle_fullscreen, tip="全屏 (回车 / F / F11)")
         self._btn(self.toolbar, "? 帮助", self.show_help, tip="帮助")
+
+        # 章节导航条（默认隐藏，打开含子文件夹/子目录的多章节书时显示）
+        self.chapter_bar = tk.Frame(self, bg=PANEL, padx=8, pady=3)
+        self.chapter_prev_btn = self._btn(self.chapter_bar, "⏮ 上一话", self.prev_chapter)
+        self.chapter_combo = ttk.Combobox(self.chapter_bar, state="readonly", width=26,
+                                          font=("Microsoft YaHei", 10))
+        self.chapter_combo.pack(side="left", padx=4)
+        self.chapter_combo.bind("<<ComboboxSelected>>", self._on_chapter_selected)
+        self.chapter_next_btn = self._btn(self.chapter_bar, "下一话 ⏭", self.next_chapter)
 
         # 状态栏
         self.status = tk.Label(self, text="请打开一个图片文件夹 / 压缩包开始阅读", bg=PANEL, fg=MUTED,
@@ -444,6 +465,7 @@ class ComicViewer(tk.Tk):
         file_menu.add_command(label="打开文件夹", command=self.open_folder)
         file_menu.add_command(label="打开图片", command=self.open_files)
         file_menu.add_command(label="打开压缩包 (zip/cbz)", command=self.open_zip)
+        file_menu.add_command(label="打开 PDF", command=self.open_pdf)
         file_menu.add_command(label="打开播放列表 (m3u/m3u8)", command=self.open_playlist)
         file_menu.add_command(label="打开历史播放", command=self.open_history_playlist)
         file_menu.add_command(label="详细信息", command=self.show_details)
@@ -455,12 +477,15 @@ class ComicViewer(tk.Tk):
         view.add_command(label="全屏 / 退出全屏", command=self.toggle_fullscreen,
                          accelerator="Enter / F / F11")
         view.add_command(label="显示 / 隐藏缩略图", command=self.toggle_thumbs, accelerator="T")
+        view.add_command(label="上一话", command=self.prev_chapter)
+        view.add_command(label="下一话", command=self.next_chapter)
         view.add_separator()
         view.add_command(label="跳到指定页", command=self.jump_to_page, accelerator="G")
         view.add_command(label="自动翻页 开 / 关", command=self.toggle_auto, accelerator="A")
         view.add_command(label="双页模式 开 / 关", command=self.toggle_spread, accelerator="D")
         view.add_command(label="阅读方向 左→右 / 右→左", command=self.toggle_direction, accelerator="M")
         view.add_command(label="裁白边 开 / 关", command=self.toggle_trim, accelerator="C")
+        view.add_command(label="纸质书质感 开 / 关", command=self.toggle_book_filter, accelerator="B")
         view.add_separator()
         view.add_command(label="适应窗口", command=lambda: self.set_fit("window"))
         view.add_command(label="适应宽度", command=lambda: self.set_fit("width"))
@@ -605,7 +630,10 @@ class ComicViewer(tk.Tk):
             "fit_mode": self.fit_mode,
             "zoom": self.zoom,
             "rotation": self.rotation,
+            "book_filter": self.book_filter,
         }
+        if self._chapters:
+            self._config[self.book_key]["chapter"] = self._chapter_index
         self._save_config()
 
     def _on_close(self):
@@ -628,23 +656,30 @@ class ComicViewer(tk.Tk):
 
     def open_files(self):
         paths = filedialog.askopenfilenames(
-            title="选择图片或压缩包（可多选）",
-            filetypes=[("图片 / 视频 / 压缩包", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff *.jfif *.mp4 *.mkv *.avi *.webm *.mov *.wmv *.flv *.m4v *.ts *.zip *.cbz"),
+            title="选择图片 / 视频 / PDF / 压缩包（可多选）",
+            filetypes=[("图片 / 视频 / PDF / 压缩包", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff *.jfif *.mp4 *.mkv *.avi *.webm *.mov *.wmv *.flv *.m4v *.ts *.pdf *.zip *.cbz"),
                        ("图片文件", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff *.jfif"),
                        ("视频文件", "*.mp4 *.mkv *.avi *.webm *.mov *.wmv *.flv *.m4v *.ts"),
+                       ("PDF 文件", "*.pdf"),
                        ("压缩包", "*.zip *.cbz"),
                        ("所有文件", "*.*")])
         if not paths:
             return
+        pdfs = [p for p in paths if os.path.splitext(p)[1].lower() in PDF_EXTS]
         zips = [p for p in paths if os.path.splitext(p)[1].lower() in ZIP_EXTS]
-        imgs = [p for p in paths if p not in zips]
-        if zips:
+        imgs = [p for p in paths if p not in pdfs and p not in zips]
+        if pdfs:
+            if len(pdfs) > 1 or zips or imgs:
+                messagebox.showinfo("提示", "PDF 请单独打开。")
+            self._load_pdf_path(pdfs[0])
+        elif zips:
             if len(zips) > 1 or imgs:
                 messagebox.showinfo("提示", "压缩包请单独打开。")
             self._load_zip_path(zips[0])
         elif imgs:
             imgs.sort(key=lambda p: natural_key(os.path.basename(p)))
             self._close_zip()
+            self._reset_chapters()
             self._playlist = []
             self._playlist_index0 = None
             self.book_key = "files:" + hashlib.sha1("|".join(imgs).encode("utf-8")).hexdigest()[:16]
@@ -655,6 +690,12 @@ class ComicViewer(tk.Tk):
                                        filetypes=[("压缩包", "*.zip *.cbz"), ("所有文件", "*.*")])
         if p:
             self._load_zip_path(p)
+
+    def open_pdf(self):
+        p = filedialog.askopenfilename(title="选择 PDF 文件（漫画）",
+                                       filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")])
+        if p:
+            self._load_pdf_path(p)
 
     def open_playlist(self):
         path = filedialog.askopenfilename(
@@ -693,7 +734,12 @@ class ComicViewer(tk.Tk):
                 continue
             source = entry if os.path.isabs(entry) else os.path.normpath(os.path.join(base_dir, entry))
             if os.path.isfile(source):
-                sources.append(source)
+                if os.path.splitext(source)[1].lower() in PDF_EXTS:
+                    n = self._pdf_page_count(source)
+                    if n > 0:
+                        sources.extend((source, i) for i in range(n))
+                else:
+                    sources.append(source)
         if not sources:
             messagebox.showinfo("提示", "播放列表中没有可访问的媒体文件。")
             return
@@ -702,11 +748,17 @@ class ComicViewer(tk.Tk):
         self.book_key = "playlist:" + os.path.abspath(path)
         self._playlist = list(sources)
         self._playlist_index0 = 0
+        self._reset_chapters()
         self._load_list(sources)
 
     def _record_history(self, src):
         """将实际播放的本地媒体写入最近播放 M3U，最新记录置顶。"""
-        if isinstance(src, tuple) or not os.path.isfile(src):
+        if isinstance(src, tuple):
+            if self._is_pdf_src(src):
+                src = src[0]   # PDF 按整本书记录
+            else:
+                return
+        if not os.path.isfile(src):
             return
         path = os.path.abspath(src)
         try:
@@ -716,6 +768,8 @@ class ComicViewer(tk.Tk):
                     history = [line.strip() for line in history_file
                                if line.strip() and not line.startswith("#")]
             key = os.path.normcase(os.path.normpath(path))
+            if history and os.path.normcase(os.path.normpath(history[0])) == key:
+                return   # 已在顶部，避免重复写盘
             history = [entry for entry in history
                        if os.path.normcase(os.path.normpath(entry)) != key]
             history.insert(0, path)
@@ -734,28 +788,76 @@ class ComicViewer(tk.Tk):
             if not names:
                 messagebox.showinfo("提示", "压缩包内没有图片或视频文件。")
                 return
-            names.sort(key=lambda n: natural_key(n.replace("\\", "/").split("/")[-1]))
+
+            # 按顶层目录分组（作为章节）；无子目录的条目归入「根目录」
+            groups = {}
+            flat = []
+            for n in names:
+                parts = n.replace("\\", "/").split("/")
+                if len(parts) > 1 and parts[0]:
+                    groups.setdefault(parts[0], []).append(n)
+                else:
+                    flat.append(n)
+
+            def sort_names(lst):
+                return sorted(lst, key=lambda n: natural_key(n.replace("\\", "/").split("/")[-1]))
+
+            chapters = []
+            if flat:
+                chapters.append({"title": "根目录", "sources": [(p, n) for n in sort_names(flat)]})
+            for top in sorted(groups, key=natural_key):
+                chapters.append({"title": top, "sources": [(p, n) for n in sort_names(groups[top])]})
+
             self._close_zip()
-            self._playlist = []
-            self._playlist_index0 = None
             self._zip = zipfile.ZipFile(p)
-            self.book_key = p
-            self._load_list([(p, n) for n in names])
+            if len(chapters) > 1:
+                self._load_chapters(chapters, book_key=p)
+            else:
+                self._reset_chapters()
+                self._playlist = []
+                self._playlist_index0 = None
+                self.book_key = p
+                self._load_list(chapters[0]["sources"])
         except Exception as e:
             messagebox.showerror("错误", "无法打开压缩包：%s" % e)
 
     def load_folder(self, d):
-        files = [os.path.join(d, f) for f in os.listdir(d)
-                 if os.path.splitext(f)[1].lower() in (IMAGE_EXTS | VIDEO_EXTS)]
-        files.sort(key=lambda p: natural_key(os.path.basename(p)))
-        if not files:
-            messagebox.showinfo("提示", "该文件夹下没有找到图片或视频文件。")
+        root_files = [os.path.join(d, f) for f in os.listdir(d)
+                      if os.path.isfile(os.path.join(d, f))
+                      and os.path.splitext(f)[1].lower() in (IMAGE_EXTS | VIDEO_EXTS | PDF_EXTS)]
+        root_files.sort(key=lambda p: natural_key(os.path.basename(p)))
+
+        subdirs = []
+        for name in os.listdir(d):
+            p = os.path.join(d, name)
+            if os.path.isdir(p):
+                files = self._media_files_in(p)
+                if files:
+                    subdirs.append((name, files))
+        subdirs.sort(key=lambda t: natural_key(t[0]))
+
+        chapters = []
+        root_src = self._expand_sources(root_files)
+        if root_src:
+            chapters.append({"title": "根目录", "sources": root_src})
+        for name, files in subdirs:
+            src = self._expand_sources(files)
+            if src:
+                chapters.append({"title": name, "sources": src})
+
+        if not chapters:
+            messagebox.showinfo("提示", "该文件夹下没有找到图片、视频或 PDF 文件。")
             return
+
         self._close_zip()
-        self._playlist = []
-        self._playlist_index0 = None
-        self.book_key = d
-        self._load_list(files)
+        if len(chapters) > 1:
+            self._load_chapters(chapters, book_key=d)
+        else:
+            self._reset_chapters()
+            self._playlist = []
+            self._playlist_index0 = None
+            self.book_key = d
+            self._load_list(chapters[0]["sources"])
 
     def _close_zip(self):
         if self._zip:
@@ -764,18 +866,167 @@ class ComicViewer(tk.Tk):
             except Exception:
                 pass
             self._zip = None
+        self._close_pdf()
 
-    def _load_list(self, sources):
+    def _close_pdf(self):
+        if self._pdf_doc is not None:
+            try:
+                self._pdf_doc.close()
+            except Exception:
+                pass
+            self._pdf_doc = None
+            self._pdf_path = None
+
+    def _pdf_document(self, path):
+        """打开并缓存 PDF 文档（按路径复用，避免每页反复打开大文件）。"""
+        if fitz is None:
+            return None
+        if self._pdf_path == path and self._pdf_doc is not None:
+            return self._pdf_doc
+        self._close_pdf()
+        try:
+            self._pdf_doc = fitz.open(path)
+            self._pdf_path = path
+            return self._pdf_doc
+        except Exception:
+            return None
+
+    def _pdf_page_count(self, path):
+        if fitz is None:
+            return 0
+        try:
+            doc = self._pdf_document(path)
+            return doc.page_count if doc is not None else 0
+        except Exception:
+            return 0
+
+    def _render_pdf_page(self, path, page_index, scale=2.0):
+        """把 PDF 的某一页渲染成 PIL 图像（scale 约等于 72*scale DPI）。"""
+        doc = self._pdf_document(path)
+        if doc is None:
+            raise RuntimeError("缺少 PyMuPDF 库或无法打开 PDF")
+        page = doc.load_page(page_index)
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+    def _load_pdf_path(self, p):
+        if fitz is None:
+            messagebox.showerror("错误", "缺少 PyMuPDF 库，无法打开 PDF。\n请在命令行运行：pip install pymupdf")
+            return
+        self._close_zip()
+        n = self._pdf_page_count(p)
+        if n <= 0:
+            messagebox.showinfo("提示", "无法读取 PDF 或该文件没有页面。")
+            return
+        self._playlist = []
+        self._playlist_index0 = None
+        self.book_key = p
+        self._reset_chapters()
+        self._load_list([(p, i) for i in range(n)])
+
+    # ---------------- 章节管理 ----------------
+    def _reset_chapters(self):
+        self._chapters = None
+        self._chapter_index = 0
+        if hasattr(self, "chapter_bar") and self.chapter_bar.winfo_manager():
+            self.chapter_bar.pack_forget()
+
+    def _media_files_in(self, directory):
+        """递归收集目录下的图片/视频/PDF，按相对路径自然排序。"""
+        out = []
+        for root, dirs, files in os.walk(directory):
+            dirs.sort(key=natural_key)
+            for f in sorted(files, key=natural_key):
+                if os.path.splitext(f)[1].lower() in (IMAGE_EXTS | VIDEO_EXTS | PDF_EXTS):
+                    out.append(os.path.join(root, f))
+        out.sort(key=lambda p: natural_key(os.path.relpath(p, directory)))
+        return out
+
+    def _expand_sources(self, paths):
+        """把文件路径列表转成页面来源列表（PDF 展开为每页）。"""
+        sources = []
+        for p in paths:
+            if os.path.splitext(p)[1].lower() in PDF_EXTS:
+                n = self._pdf_page_count(p)
+                if n > 0:
+                    sources.extend((p, i) for i in range(n))
+            else:
+                sources.append(p)
+        return sources
+
+    def _load_chapters(self, chapters, book_key):
+        if not chapters:
+            self._reset_chapters()
+            return
+        self._chapters = chapters
+        self.book_key = book_key
+        ci = 0
+        if book_key in self._config:
+            try:
+                ci = clamp(int(self._config[book_key].get("chapter", 0)), 0, len(chapters) - 1)
+            except Exception:
+                ci = 0
+        self._chapter_index = ci
+        self._playlist = []
+        self._playlist_index0 = None
+        self._load_list(chapters[ci]["sources"], restore_index=True)
+        self._refresh_chapter_ui()
+
+    def _chapter_prefix(self):
+        if self._chapters and 0 <= self._chapter_index < len(self._chapters):
+            return self._chapters[self._chapter_index]["title"] + " · "
+        return ""
+
+    def _refresh_chapter_ui(self):
+        if self._chapters and len(self._chapters) > 1:
+            titles = [c["title"] for c in self._chapters]
+            self.chapter_combo.configure(values=titles)
+            self.chapter_combo.current(self._chapter_index)
+            if not self.chapter_bar.winfo_manager():
+                self.chapter_bar.pack(side="top", fill="x", before=self.content)
+            self.chapter_prev_btn.configure(state="normal" if self._chapter_index > 0 else "disabled")
+            self.chapter_next_btn.configure(
+                state="normal" if self._chapter_index < len(self._chapters) - 1 else "disabled")
+        else:
+            self._reset_chapters()
+
+    def switch_chapter(self, ci):
+        if not self._chapters:
+            return
+        ci = clamp(ci, 0, len(self._chapters) - 1)
+        if ci == self._chapter_index:
+            return
+        self._chapter_index = ci
+        self._load_list(self._chapters[ci]["sources"], restore_index=False)
+        self._refresh_chapter_ui()
+
+    def next_chapter(self):
+        if self._chapters:
+            self.switch_chapter(self._chapter_index + 1)
+
+    def prev_chapter(self):
+        if self._chapters:
+            self.switch_chapter(self._chapter_index - 1)
+
+    def _on_chapter_selected(self, event=None):
+        if self._chapters:
+            idx = self.chapter_combo.current()
+            if idx >= 0:
+                self.switch_chapter(idx)
+
+    def _load_list(self, sources, restore_index=True):
         self.sources = sources
         start = 0
         if self.book_key in self._config:
             try:
                 cfg = self._config[self.book_key]
-                start = clamp(int(cfg.get("index", 0)), 0, len(sources) - 1)
+                if restore_index:
+                    start = clamp(int(cfg.get("index", 0)), 0, len(sources) - 1)
                 self.spread_mode = bool(cfg.get("spread_mode", True))
                 self.reading_direction = "rtl" if cfg.get("direction") == "rtl" else "ltr"
                 self.trim_mode = bool(cfg.get("trim_mode", False))
                 self._compare_mode = bool(cfg.get("compare_mode", False))
+                self.book_filter = bool(cfg.get("book_filter", False))
                 fm = cfg.get("fit_mode", "window")
                 self.fit_mode = fm if fm in ("width", "height", "window", "actual") else "window"
             except Exception:
@@ -790,6 +1041,8 @@ class ComicViewer(tk.Tk):
     # ---------------- 图片读取 ----------------
     def _display_name(self, src):
         if isinstance(src, tuple):
+            if self._is_pdf_src(src):
+                return "%s · 第 %d 页" % (os.path.basename(src[0]), src[1] + 1)
             name = src[1].replace("\\", "/").split("/")[-1]
             return name or src[1]
         return os.path.basename(src)
@@ -797,6 +1050,8 @@ class ComicViewer(tk.Tk):
     def _open_raw(self, src):
         """惰性打开（用于缩略图，避免整图解码）。"""
         if isinstance(src, tuple):
+            if self._is_pdf_src(src):
+                return self._render_pdf_page(src[0], src[1])
             z = self._zip or zipfile.ZipFile(src[0])
             return Image.open(io.BytesIO(z.read(src[1])))
         return Image.open(src)
@@ -865,7 +1120,13 @@ class ComicViewer(tk.Tk):
         return canvas
 
     # ---------------- 视频 -------------
+    @staticmethod
+    def _is_pdf_src(src):
+        return isinstance(src, tuple) and os.path.splitext(src[0])[1].lower() in PDF_EXTS
+
     def _is_video(self, src):
+        if self._is_pdf_src(src):
+            return False
         name = src[1] if isinstance(src, tuple) else src
         return os.path.splitext(name)[1].lower() in VIDEO_EXTS
 
@@ -2136,6 +2397,11 @@ class ComicViewer(tk.Tk):
         if (dw, dh) != im.size:
             im = im.resize((dw, dh), RESAMPLE)
 
+        if self.book_filter:
+            is_spread = (self._spread_img is not None) or (
+                self._compare_mode and getattr(self, "_compare_img", None) is not None)
+            im = self._apply_book_filter(im, is_spread)
+
         self.display = im
         self.photo = ImageTk.PhotoImage(im)
         self.canvas.delete("img")
@@ -2225,6 +2491,70 @@ class ComicViewer(tk.Tk):
         if self.sources and not self.is_video:
             self.show_file(self.index)
         self._save_progress()
+
+    def toggle_book_filter(self):
+        self.book_filter = not self.book_filter
+        self._sync_toggle_buttons()
+        if self.sources and not self.is_video:
+            self._render()
+        self._save_progress()
+
+    @staticmethod
+    def _to_rgb(im):
+        if im.mode == "RGB":
+            return im
+        if im.mode == "RGBA":
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.getchannel("A"))
+            return bg
+        return im.convert("RGB")
+
+    def _paper_grain(self, size):
+        """生成低强度细颗粒纸张纹理（缓存 256px 噪点块再平铺）。"""
+        if self._grain_tile is None:
+            tile = Image.effect_noise((256, 256), 10)
+            self._grain_tile = (np.asarray(tile, dtype=np.float32) - 128.0) / 128.0
+        w, h = size
+        tile = self._grain_tile
+        th, tw = tile.shape
+        reps_h = (h + th - 1) // th
+        reps_w = (w + tw - 1) // tw
+        tiled = np.tile(tile, (reps_h, reps_w))[:h, :w]
+        return (tiled * 0.03).astype(np.float32)[..., None]
+
+    def _apply_book_filter(self, im, is_spread):
+        """模拟纸质书质感：光影 + 书脊阴影 + 页边厚度阴影 + 纸张纹理。
+        全部按亮度乘法处理，不改变图片内容，只叠加阅读氛围。"""
+        if np is None:
+            return im
+        im = self._to_rgb(im)
+        w, h = im.size
+        try:
+            arr = np.asarray(im, dtype=np.float32)
+            x = np.linspace(-1.0, 1.0, w, dtype=np.float32)
+            y = np.linspace(-1.0, 1.0, h, dtype=np.float32)
+            x2 = x * x
+            y2 = y * y
+
+            # 光影：轻微暗角（中心自然、四周略暗）
+            mask = 1.0 - 0.06 * (y2[:, None] + x2[None, :])
+
+            # 书脊阴影：双页（或对比模式）时压暗中间
+            if is_spread:
+                mask = mask - 0.20 * np.exp(-x2 / 0.015)[None, :]
+
+            # 页边厚度阴影：左右两侧 + 底部
+            side = 0.10 * np.exp(-((np.abs(x) - 1.0) ** 2) / 0.02)
+            bottom = 0.08 * np.exp(-((y - 1.0) ** 2) / 0.03)
+            mask = mask - (side[None, :] + bottom[:, None])
+
+            arr = np.clip(arr * np.clip(mask, 0.55, 1.2)[..., None], 0, 255)
+
+            # 纸张纹理
+            arr = np.clip(arr * (1.0 + self._paper_grain((w, h))), 0, 255)
+            return Image.fromarray(arr.astype(np.uint8), "RGB")
+        except Exception:
+            return im
 
     def toggle_compare(self):
         """切换图片对比模式（连续两图并排显示）。
@@ -2604,6 +2934,8 @@ class ComicViewer(tk.Tk):
             self.toggle_direction()
         elif k in ("c", "C"):
             self.toggle_trim()
+        elif k in ("b", "B"):
+            self.toggle_book_filter()
         elif k in ("s", "S"):
             if self.is_video:
                 self._choose_subtitle()
@@ -2749,7 +3081,10 @@ class ComicViewer(tk.Tk):
         details = ["文件名: " + name]
         if isinstance(src, tuple):
             details.append("来源: " + src[0])
-            details.append("压缩包条目: " + src[1])
+            if self._is_pdf_src(src):
+                details.append("页码: 第 %d 页（共 %d 页）" % (src[1] + 1, self._pdf_page_count(src[0]) or 0))
+            else:
+                details.append("压缩包条目: " + src[1])
         else:
             try:
                 details.append("路径: " + os.path.abspath(src))
@@ -2795,9 +3130,9 @@ class ComicViewer(tk.Tk):
             self.zoom_label.configure(text="画面 %d%%" % round(self._video_zoom * 100))
             self.zoom_out_btn.configure(state="normal")
             self.zoom_in_btn.configure(state="normal")
-            self.status.configure(text=name + "   ·   视频   ·   画面 %d%%" % round(self._video_zoom * 100))
+            self.status.configure(text=self._chapter_prefix() + name + "   ·   视频   ·   画面 %d%%" % round(self._video_zoom * 100))
             return
-        name = self._display_name(self.sources[self.index])
+        name = self._chapter_prefix() + self._display_name(self.sources[self.index])
         if self._spread_img is not None:
             name += " + " + self._display_name(self.sources[self.index + 1])
             page = "%d-%d / %d" % (self.index + 1, self.index + 2, len(self.sources))
@@ -2807,12 +3142,13 @@ class ComicViewer(tk.Tk):
         rot = (" · 旋转 %d°" % self.rotation) if self.rotation else ""
         rtl = " · 右→左" if self._is_rtl() else ""
         auto = (" · 自动翻页 %gs" % self.auto_interval) if self.auto_flip else ""
+        book = " · 纸质" if self.book_filter else ""
         self.page_label.configure(text=page)
         self.zoom_label.configure(text="%d%%" % int(round(self.zoom * 100)))
         self.zoom_out_btn.configure(state="normal")
         self.zoom_in_btn.configure(state="normal")
-        self.status.configure(text="%s   ·   %d×%d   ·   %d%%%s%s%s" % (
-            name, w, h, int(round(self.zoom * 100)), rot, rtl, auto))
+        self.status.configure(text="%s   ·   %d×%d   ·   %d%%%s%s%s%s" % (
+            name, w, h, int(round(self.zoom * 100)), rot, rtl, auto, book))
 
     def _show_start(self):
         self.canvas.delete("all")
