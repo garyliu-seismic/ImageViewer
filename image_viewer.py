@@ -83,8 +83,8 @@ ZIP_EXTS = {".zip", ".cbz"}
 PDF_EXTS = {".pdf"}
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".wmv", ".flv", ".m4v", ".ts", ".mpg", ".mpeg", ".3gp"}
 
-CAPTION_LANGS = ["中文", "英文", "日语"]
-CAPTION_LANG_CODES = {"中文": "zh", "英文": "en", "日语": "ja"}
+CAPTION_LANGS = ["中文", "英文", "日语", "韩语", "粤语"]
+CAPTION_LANG_CODES = {"中文": "zh", "英文": "en", "日语": "ja", "韩语": "ko", "粤语": "yue"}
 CAPTION_MODES = ["原声", "中文翻译", "AI 翻译"]
 CAPTION_MODE_CODES = {"原声": "original", "中文翻译": "translate", "AI 翻译": "ai_translate"}
 
@@ -2125,10 +2125,18 @@ class ComicViewer(tk.Tk):
             self.rate_label.configure(text="%.1f×" % self._rate)
 
     def _on_caption_lang_change(self, event=None):
-        if self.caption_lang_var.get() == "中文":
+        lang = self.caption_lang_var.get()
+        if lang == "中文":
             self.caption_mode_var.set("原声")
             self.caption_mode_combo.configure(state="disabled")
         else:
+            if lang in ("韩语", "粤语"):
+                # 韩语/粤语没有离线 Argos 翻译模型，只保留「原声」和「AI 翻译」
+                self.caption_mode_combo.configure(values=["原声", "AI 翻译"])
+                if self.caption_mode_var.get() == "中文翻译":
+                    self.caption_mode_var.set("原声")
+            else:
+                self.caption_mode_combo.configure(values=CAPTION_MODES)
             self.caption_mode_combo.configure(state="readonly")
         self._restart_captions_if_active()
 

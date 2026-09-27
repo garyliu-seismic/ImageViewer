@@ -49,11 +49,10 @@ _RESET = object()
 # 回调创建后 append 到这里，进程存活期间一直持有引用。
 _CALLBACK_KEEPALIVE = []
 
-# 英文/日语仍用 vosk（小模型已足够准）；中文换成 sherpa-onnx 流式 Zipformer，
-# 精度远高于 vosk 中文小模型，且可扩展标点恢复与说话人分离。
+# 英文仍用 vosk（小模型已足够准）；中文换 sherpa-onnx 流式 Zipformer，日语换
+# SenseVoice 离线多语种模型（+ silero-vad 分句），精度与标点都优于 vosk。
 DEFAULT_MODEL_PATHS = {
     "en": r"C:\models\vosk-model-small-en-us-0.15",
-    "ja": r"C:\models\vosk-model-small-ja-0.22",
 }
 
 # 中文 sherpa-onnx 流式模型（int8，约 160MB）。目录内需包含：
@@ -80,6 +79,24 @@ PUNCT_ZH_NUM_THREADS = 2
 
 def _sherpa_punct_path():
     return os.environ.get("SHERPA_PUNCT_MODEL_ZH") or PUNCT_ZH_MODEL
+
+
+# 日语 SenseVoice 离线多语种模型（int8，约 228MB）+ silero-vad 分句。
+SENSEVOICE_JA_MODEL_DIR = r"C:\models\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
+SILERO_VAD_MODEL = r"C:\models\silero_vad.onnx"
+SENSEVOICE_NUM_THREADS = 4
+
+
+def _sensevoice_paths():
+    d = os.environ.get("SENSEVOICE_MODEL_DIR_JA") or SENSEVOICE_JA_MODEL_DIR
+    return {
+        "tokens": os.path.join(d, "tokens.txt"),
+        "model": os.path.join(d, "model.int8.onnx"),
+    }
+
+
+def _silero_vad_path():
+    return os.environ.get("SILERO_VAD_MODEL") or SILERO_VAD_MODEL
 
 AI_PRESETS = {
     "DeepSeek": ("https://api.deepseek.com", "deepseek-chat"),
@@ -215,6 +232,55 @@ class _Punctuator:
             return text
 
 
+class _SenseVoiceASR:
+    """SenseVoice 离线多语种识别 + silero-vad 分句（日语）。
+
+    离线模型没有逐帧 partial，靠 silero-vad 按静音把音频切成语音段，段结束
+    即整句转写（use_itn 自带标点）。字幕比流式模型晚 0.5~1.5s，接近 YouTube
+    自动字幕的节奏。"""
+
+    def __init__(self, tokens, model, vad_model, sample_rate, num_threads, language="ja"):
+        import sherpa_onnx
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            tokens=tokens, model=model, num_threads=num_threads,
+            sample_rate=sample_rate, feature_dim=80,
+            language=language, use_itn=True)
+        vad_cfg = sherpa_onnx.VadModelConfig(
+            silero_vad=sherpa_onnx.SileroVadModelConfig(
+                model=vad_model, threshold=0.5,
+                min_silence_duration=0.5, min_speech_duration=0.25,
+                max_speech_duration=20),
+            sample_rate=sample_rate, num_threads=num_threads)
+        self._vad = sherpa_onnx.VoiceActivityDetector(vad_cfg, buffer_size_in_seconds=60)
+        self._sample_rate = sample_rate
+
+    def create_stream(self):
+        # 离线模型无流式 stream，返回 None 占位（_rec_worker 不依赖它）。
+        return None
+
+    def feed(self, stream, pcm_bytes):
+        """喂 PCM 给 VAD；切出完整语音段就转写，返回 ("final", text) 或 None。"""
+        import numpy as np
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        self._vad.accept_waveform(samples)
+        if self._vad.empty():
+            return None
+        seg = self._vad.front
+        seg_samples = np.asarray(seg.samples, dtype=np.float32)
+        self._vad.pop()
+        text = self._transcribe(seg_samples)
+        return ("final", text) if text else None
+
+    def reset(self, stream):
+        self._vad.reset()
+
+    def _transcribe(self, samples):
+        s = self._recognizer.create_stream()
+        s.accept_waveform(self._sample_rate, samples)
+        self._recognizer.decode_stream(s)
+        return (s.result.text or "").strip()
+
+
 class LiveCaptioner:
     def __init__(self, source_lang="en", caption_mode="original", model_path=None, ai_cfg=None):
         self.source_lang = source_lang
@@ -255,6 +321,10 @@ class LiveCaptioner:
     def available(self):
         if self.source_lang == "zh":
             return all(os.path.isfile(p) for p in _sherpa_zh_paths().values())
+        if self.source_lang in ("ja", "ko", "yue"):
+            p = _sensevoice_paths()
+            return (os.path.isfile(p["tokens"]) and os.path.isfile(p["model"])
+                    and os.path.isfile(_silero_vad_path()))
         return bool(self.model_path) and os.path.isdir(self.model_path)
 
     def _load_model(self):
@@ -265,16 +335,20 @@ class LiveCaptioner:
                     paths["tokens"], paths["encoder"], paths["decoder"], paths["joiner"],
                     SAMPLE_RATE, SHERPA_ZH_NUM_THREADS,
                     punct_model=_sherpa_punct_path(), punct_threads=PUNCT_ZH_NUM_THREADS)
+            elif self.source_lang in ("ja", "ko", "yue"):
+                paths = _sensevoice_paths()
+                self._asr = _SenseVoiceASR(
+                    paths["tokens"], paths["model"], _silero_vad_path(),
+                    SAMPLE_RATE, SENSEVOICE_NUM_THREADS, language=self.source_lang)
             else:
                 self._asr = _VoskASR(self.model_path, SAMPLE_RATE)
         if self.caption_mode in ("translate", "ai_translate") and self._translator is None and self.source_lang != "zh":
             try:
                 import translation_engine
-                self._translator = translation_engine.build_translator(self.source_lang, "zh")
+                if translation_engine.available(self.source_lang, "zh"):
+                    self._translator = translation_engine.build_translator(self.source_lang, "zh")
             except Exception:
-                if self.caption_mode == "translate":
-                    raise
-                self._translator = None  # ai_translate 模式下 Argos 只作兜底，缺失可继续
+                self._translator = None  # 离线翻译缺失/失败时，字幕回退为原声
         return self._asr
 
     def start_async(self, player, stop_fn=None):
@@ -298,6 +372,13 @@ class LiveCaptioner:
                     "未找到中文字幕模型（sherpa-onnx Zipformer）：请把模型放到 %s，"
                     "或设置环境变量 SHERPA_MODEL_DIR_ZH 指定目录"
                     % SHERPA_ZH_MODEL_DIR
+                )
+            elif self.source_lang in ("ja", "ko", "yue"):
+                lang_name = {"ja": "日语", "ko": "韩语", "yue": "粤语"}[self.source_lang]
+                self.error = (
+                    "未找到%s字幕模型（SenseVoice + silero-vad）：请把模型放到 %s、"
+                    "VAD 放到 %s（可用环境变量 SENSEVOICE_MODEL_DIR_JA / SILERO_VAD_MODEL 指定）"
+                    % (lang_name, SENSEVOICE_JA_MODEL_DIR, SILERO_VAD_MODEL)
                 )
             else:
                 self.error = (

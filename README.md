@@ -8,7 +8,7 @@
 |------|------|
 | `image_viewer.py` | 桌面版主程序（tkinter + Pillow） |
 | `image-viewer.html` | 网页版（单文件，浏览器直接打开） |
-| `caption_engine.py` | 视频实时字幕引擎（英文/日语 vosk、中文 sherpa-onnx 识别 + 翻译） |
+| `caption_engine.py` | 视频实时字幕引擎（英文 vosk、中文 sherpa-onnx、日语 SenseVoice 识别 + 翻译） |
 | `translation_engine.py` | 离线字幕翻译（Argos / ctranslate2） |
 | `dlna_cast.py` | DLNA 投屏（SSDP 发现 + AVTransport SOAP 控制 + 本地流媒体） |
 | `viewer.ico` | 程序图标 |
@@ -22,22 +22,23 @@
 pip install Pillow        # 必需
 pip install pymupdf       # 可选：阅读 PDF 漫画需要
 pip install python-vlc    # 可选：播放视频需要（另需安装 VLC）
-pip install vosk sounddevice          # 可选：视频实时字幕（英文/日语）需要
+pip install vosk sounddevice          # 可选：视频实时字幕（英文）需要
 pip install sherpa-onnx               # 可选：中文实时字幕（准确率更高）需要
 pip install ctranslate2 sentencepiece # 可选：字幕翻译成中文需要
 python image_viewer.py
 ```
 
 视频页可点击 **CC 字幕** 开启本地实时字幕（离线识别，无需联网），旁边两个下拉框选
-**音频语言**（中文 / 英文 / 日语）和**字幕**（原声 / 中文翻译 / AI 翻译；选中文音频
-时翻译选项不可用）。识别后端：**英文/日语用 vosk**，**中文用 sherpa-onnx 流式
-Zipformer**（中文准确率远高于 vosk 中文小模型）。默认模型路径：
+**音频语言**（中文 / 英文 / 日语 / 韩语 / 粤语）和**字幕**（原声 / 中文翻译 / AI 翻译；
+选中文音频时翻译选项不可用；韩语/粤语无离线翻译模型，只支持原声和 AI 翻译）。识别后端：
+**英文用 vosk**、**中文用 sherpa-onnx 流式 Zipformer**、**日语/韩语/粤语用 SenseVoice
+（离线多语种 + silero-vad 分句，自带标点）**。默认模型路径：
 
 | 语言 | 默认路径 | 环境变量覆盖 |
 |------|----------|--------------|
 | 中文 | `C:\models\sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30`（含 tokens.txt / encoder.int8.onnx / decoder.onnx / joiner.int8.onnx） | `SHERPA_MODEL_DIR_ZH` |
 | 英文 | `C:\models\vosk-model-small-en-us-0.15` | `VOSK_MODEL_PATH_EN` |
-| 日语 | `C:\models\vosk-model-small-ja-0.22` | `VOSK_MODEL_PATH_JA` |
+| 日语/韩语/粤语 | `C:\models\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17`（含 tokens.txt / model.int8.onnx）+ `C:\models\silero_vad.onnx` | `SENSEVOICE_MODEL_DIR_JA` / `SILERO_VAD_MODEL` |
 
 中文模型下载（约 132MB）：
 
@@ -57,6 +58,15 @@ tar xjf punct.zip
 
 默认路径 `C:\models\sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8\model.int8.onnx`，
 可用环境变量 `SHERPA_PUNCT_MODEL_ZH` 覆盖。
+
+日语/韩语/粤语模型下载（约 163MB + VAD 644KB；自带标点）：
+
+```bash
+cd C:\models
+curl -L -o ja.zip https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2
+curl -L -o silero_vad.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+tar xjf ja.zip
+```
 
 **字幕翻译**有两种方式：
 
@@ -108,7 +118,7 @@ DLNA 设备（极米投影仪 / 电视 / 盒子等）。原理是 DLNA：本地�
   - 播放控制：倍速 0.5×~60×、进度条拖动跳转、音量、快进/快退（±5s，Ctrl=±30s）
   - 循环模式：A-B 循环 / 单曲循环 / 列表循环 / 列表随机
   - 投屏：把视频投到局域网里的 Chromecast / DLNA 电视 / 盒子（视频条「📺 投屏」按钮）
-- 视频实时字幕（英文/日语 vosk、中文 sherpa-onnx 离线识别）+ 离线翻译（Argos）+ AI 翻译（LLM）+ 外挂字幕（.srt/.ass）
+- 视频实时字幕（英文 vosk、中文 sherpa-onnx、日语 SenseVoice 离线识别）+ 离线翻译（Argos）+ AI 翻译（LLM）+ 外挂字幕（.srt/.ass）
 - 支持格式：png / jpg / jpeg / gif / webp / bmp / tif / tiff / avif / jfif / pdf（漫画 PDF，按页阅读）
 
 ## 快捷键
