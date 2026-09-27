@@ -8,7 +8,7 @@
 |------|------|
 | `image_viewer.py` | 桌面版主程序（tkinter + Pillow） |
 | `image-viewer.html` | 网页版（单文件，浏览器直接打开） |
-| `caption_engine.py` | 视频实时字幕引擎（vosk 识别 + 翻译） |
+| `caption_engine.py` | 视频实时字幕引擎（英文/日语 vosk、中文 sherpa-onnx 识别 + 翻译） |
 | `translation_engine.py` | 离线字幕翻译（Argos / ctranslate2） |
 | `dlna_cast.py` | DLNA 投屏（SSDP 发现 + AVTransport SOAP 控制 + 本地流媒体） |
 | `viewer.ico` | 程序图标 |
@@ -22,20 +22,41 @@
 pip install Pillow        # 必需
 pip install pymupdf       # 可选：阅读 PDF 漫画需要
 pip install python-vlc    # 可选：播放视频需要（另需安装 VLC）
-pip install vosk sounddevice          # 可选：视频实时字幕需要
+pip install vosk sounddevice          # 可选：视频实时字幕（英文/日语）需要
+pip install sherpa-onnx               # 可选：中文实时字幕（准确率更高）需要
 pip install ctranslate2 sentencepiece # 可选：字幕翻译成中文需要
 python image_viewer.py
 ```
 
-视频页可点击 **CC 字幕** 开启本地实时字幕（基于 vosk，离线识别，无需联网），旁边
-两个下拉框选**音频语言**（中文 / 英文 / 日语）和**字幕**（原声 / 中文翻译 / AI 翻译；
-选中文音频时翻译选项不可用）。默认模型路径：
+视频页可点击 **CC 字幕** 开启本地实时字幕（离线识别，无需联网），旁边两个下拉框选
+**音频语言**（中文 / 英文 / 日语）和**字幕**（原声 / 中文翻译 / AI 翻译；选中文音频
+时翻译选项不可用）。识别后端：**英文/日语用 vosk**，**中文用 sherpa-onnx 流式
+Zipformer**（中文准确率远高于 vosk 中文小模型）。默认模型路径：
 
 | 语言 | 默认路径 | 环境变量覆盖 |
 |------|----------|--------------|
-| 中文 | `C:\models\vosk-model-small-cn-0.22` | `VOSK_MODEL_PATH_ZH` |
+| 中文 | `C:\models\sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30`（含 tokens.txt / encoder.int8.onnx / decoder.onnx / joiner.int8.onnx） | `SHERPA_MODEL_DIR_ZH` |
 | 英文 | `C:\models\vosk-model-small-en-us-0.15` | `VOSK_MODEL_PATH_EN` |
 | 日语 | `C:\models\vosk-model-small-ja-0.22` | `VOSK_MODEL_PATH_JA` |
+
+中文模型下载（约 132MB）：
+
+```bash
+cd C:\models
+curl -L -o zh.zip https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30.tar.bz2
+tar xjf zh.zip
+```
+
+中文标点恢复（可选，约 65MB 下载；缺失时字幕照常、只是没有句号逗号）：
+
+```bash
+cd C:\models
+curl -L -o punct.zip https://github.com/k2-fsa/sherpa-onnx/releases/download/punctuation-models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8.tar.bz2
+tar xjf punct.zip
+```
+
+默认路径 `C:\models\sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8\model.int8.onnx`，
+可用环境变量 `SHERPA_PUNCT_MODEL_ZH` 覆盖。
 
 **字幕翻译**有两种方式：
 
@@ -53,7 +74,7 @@ python image_viewer.py
 视频页还支持 **外挂字幕**（`.srt` / `.ass`），在 视图 → 外挂字幕 或按 `S` 选择，
 可自动加载与视频同名的字幕文件。
 
-开启字幕后播放音质会降到 16kHz 单声道（vosk 识别要求的格式）。关闭字幕后声音会
+开启字幕后播放音质会降到 16kHz 单声道（识别模型要求的格式）。关闭字幕后声音会
 保留（音频输出仍由字幕引擎透传播放，避免「开字幕有声音、关字幕变无声」），但
 音量滑块依然不生效、音质也仍停留在 16kHz 单声道——直到切换到下一个视频才会恢复
 VLC 原生音频输出。
@@ -87,7 +108,7 @@ DLNA 设备（极米投影仪 / 电视 / 盒子等）。原理是 DLNA：本地�
   - 播放控制：倍速 0.5×~60×、进度条拖动跳转、音量、快进/快退（±5s，Ctrl=±30s）
   - 循环模式：A-B 循环 / 单曲循环 / 列表循环 / 列表随机
   - 投屏：把视频投到局域网里的 Chromecast / DLNA 电视 / 盒子（视频条「📺 投屏」按钮）
-- 视频实时字幕（vosk 离线识别）+ 离线翻译（Argos）+ AI 翻译（LLM）+ 外挂字幕（.srt/.ass）
+- 视频实时字幕（英文/日语 vosk、中文 sherpa-onnx 离线识别）+ 离线翻译（Argos）+ AI 翻译（LLM）+ 外挂字幕（.srt/.ass）
 - 支持格式：png / jpg / jpeg / gif / webp / bmp / tif / tiff / avif / jfif / pdf（漫画 PDF，按页阅读）
 
 ## 快捷键

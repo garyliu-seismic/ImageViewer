@@ -7,7 +7,7 @@
 #   - 打包为 onedir（文件夹）形式，产物在 dist/ImageViewer/，可作为安装包内容。
 #   - 内置：tkinter / Pillow / numpy / PyMuPDF（PDF 漫画）/ vlc（python 绑定，
 #     播放视频仍需目标机装有 VLC 播放器）。
-#   - 排除：vosk / sounddevice / ctranslate2 / sentencepiece 等大型可选依赖
+#   - 排除：vosk / sounddevice / sherpa-onnx / ctranslate2 / sentencepiece 等大型可选依赖
 #     （实时字幕与离线翻译需要额外的大模型文件 + 原生库，程序已做优雅降级，
 #       不打包这些也不影响图片/漫画/PDF/投屏等核心功能）。
 #   - 附带 image-viewer.html 网页版到程序目录，方便用户顺带使用。
@@ -40,6 +40,9 @@ a = Analysis(
     excludes=[
         'vosk',
         'sounddevice',
+        'sherpa_onnx',
+        'sherpa_onnx_core',
+        'onnxruntime',
         'ctranslate2',
         'sentencepiece',
         'matplotlib',

@@ -5,7 +5,8 @@ caption_engine.py -- 本地实时字幕引擎（桌面版视频播放用）
 用 VLC 的原始音频回调（audio_set_format + audio_set_callbacks）拿到解码后的 PCM：
   1) 写回一个本地播放流（sounddevice），保证视频仍然有声音 -- VLC 文档写明一旦
      设置了 audio 回调，libvlc 自身就不再输出任何声音了。
-  2) 同时喂给 vosk 做流式识别，识别结果放进队列，UI 线程轮询取字幕文本。
+  2) 同时喂给识别器做流式识别（英文/日语用 vosk，中文用 sherpa-onnx
+     Zipformer），识别结果放进队列，UI 线程轮询取字幕文本。
 
 代价：开启字幕后播放音质降到 16kHz 单声道（vosk 要求的格式）；关闭字幕后调
 用方清空回调，libvlc 会按文档重新选择默认的音频输出模块 -- 但具体音质是否
@@ -48,11 +49,37 @@ _RESET = object()
 # 回调创建后 append 到这里，进程存活期间一直持有引用。
 _CALLBACK_KEEPALIVE = []
 
+# 英文/日语仍用 vosk（小模型已足够准）；中文换成 sherpa-onnx 流式 Zipformer，
+# 精度远高于 vosk 中文小模型，且可扩展标点恢复与说话人分离。
 DEFAULT_MODEL_PATHS = {
-    "zh": r"C:\models\vosk-model-small-cn-0.22",
     "en": r"C:\models\vosk-model-small-en-us-0.15",
     "ja": r"C:\models\vosk-model-small-ja-0.22",
 }
+
+# 中文 sherpa-onnx 流式模型（int8，约 160MB）。目录内需包含：
+#   tokens.txt / encoder.int8.onnx / decoder.onnx / joiner.int8.onnx
+SHERPA_ZH_MODEL_DIR = r"C:\models\sherpa-onnx-streaming-zipformer-zh-int8-2025-06-30"
+SHERPA_ZH_FILES = {
+    "tokens": "tokens.txt",
+    "encoder": "encoder.int8.onnx",
+    "decoder": "decoder.onnx",
+    "joiner": "joiner.int8.onnx",
+}
+SHERPA_ZH_NUM_THREADS = 4
+
+
+def _sherpa_zh_paths():
+    d = os.environ.get("SHERPA_MODEL_DIR_ZH") or SHERPA_ZH_MODEL_DIR
+    return {k: os.path.join(d, v) for k, v in SHERPA_ZH_FILES.items()}
+
+
+# 中文标点恢复模型（ct-transformer，int8，约 72MB，可选；缺失时字幕照常、只是无标点）。
+PUNCT_ZH_MODEL = r"C:\models\sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8\model.int8.onnx"
+PUNCT_ZH_NUM_THREADS = 2
+
+
+def _sherpa_punct_path():
+    return os.environ.get("SHERPA_PUNCT_MODEL_ZH") or PUNCT_ZH_MODEL
 
 AI_PRESETS = {
     "DeepSeek": ("https://api.deepseek.com", "deepseek-chat"),
@@ -91,6 +118,103 @@ def _default_model_path(lang):
     return os.environ.get("VOSK_MODEL_PATH_%s" % lang.upper()) or DEFAULT_MODEL_PATHS.get(lang)
 
 
+class _VoskASR:
+    """vosk 识别后端（英文 / 日语）。"""
+
+    def __init__(self, model_path, sample_rate):
+        import vosk
+        vosk.SetLogLevel(-1)
+        self._model = vosk.Model(model_path=model_path)
+        self._sample_rate = sample_rate
+
+    def create_stream(self):
+        import vosk
+        rec = vosk.KaldiRecognizer(self._model, self._sample_rate)
+        rec.SetWords(False)
+        return rec
+
+    def feed(self, stream, pcm_bytes):
+        """喂一段 int16 PCM，返回 ("final"/"partial", text) 或 None。"""
+        import json
+        if stream.AcceptWaveform(pcm_bytes):
+            text = json.loads(stream.Result()).get("text", "")
+            return ("final", text) if text else None
+        text = json.loads(stream.PartialResult()).get("partial", "")
+        return ("partial", text) if text else None
+
+    def reset(self, stream):
+        try:
+            stream.Reset()
+        except Exception:
+            pass
+
+
+class _SherpaASR:
+    """sherpa-onnx 流式 Zipformer 识别后端（中文，int8）。"""
+
+    def __init__(self, tokens, encoder, decoder, joiner, sample_rate, num_threads,
+                 punct_model=None, punct_threads=2):
+        import sherpa_onnx
+        self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+            tokens=tokens, encoder=encoder, decoder=decoder, joiner=joiner,
+            num_threads=num_threads, sample_rate=sample_rate, feature_dim=80,
+            model_type="zipformer2",
+            enable_endpoint_detection=True,
+            rule1_min_trailing_silence=1.5,
+            rule2_min_trailing_silence=0.8,
+            rule3_min_utterance_length=20,
+        )
+        self._sample_rate = sample_rate
+        self._punct = None
+        if punct_model and os.path.isfile(punct_model):
+            try:
+                self._punct = _Punctuator(punct_model, punct_threads)
+            except Exception:
+                self._punct = None  # 标点模型加载失败不影响识别
+
+    def create_stream(self):
+        return self._recognizer.create_stream()
+
+    def feed(self, stream, pcm_bytes):
+        """喂一段 int16 PCM，返回 ("final"/"partial", text) 或 None。
+
+        检测到端点（句末静音）时先取整句结果再 reset 流，开始下一句。"""
+        import numpy as np
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        stream.accept_waveform(self._sample_rate, samples)
+        while self._recognizer.is_ready(stream):
+            self._recognizer.decode_stream(stream)
+        text = self._recognizer.get_result(stream)
+        if self._recognizer.is_endpoint(stream):
+            self._recognizer.reset(stream)
+            if text:
+                if self._punct is not None:
+                    text = self._punct.apply(text)
+                return ("final", text)
+            return None
+        return ("partial", text) if text else None
+
+    def reset(self, stream):
+        self._recognizer.reset(stream)
+
+
+class _Punctuator:
+    """ct-transformer 中文标点恢复（int8，离线）。"""
+
+    def __init__(self, model_path, num_threads):
+        import sherpa_onnx
+        cfg = sherpa_onnx.OfflinePunctuationConfig(
+            model=sherpa_onnx.OfflinePunctuationModelConfig(
+                ct_transformer=model_path, num_threads=num_threads))
+        self._punct = sherpa_onnx.OfflinePunctuation(cfg)
+
+    def apply(self, text):
+        try:
+            return self._punct.add_punctuation(text)
+        except Exception:
+            return text
+
+
 class LiveCaptioner:
     def __init__(self, source_lang="en", caption_mode="original", model_path=None, ai_cfg=None):
         self.source_lang = source_lang
@@ -99,9 +223,9 @@ class LiveCaptioner:
         self.ai_cfg = ai_cfg or {}
         self.queue = queue.Queue()
         self.error = None
-        self._model = None
+        self._asr = None
         self._translator = None
-        self._recognizer = None
+        self._stream = None
         self._out_stream = None
         self._play_cb = None
         self._flush_cb = None
@@ -124,18 +248,25 @@ class LiveCaptioner:
         # 过：open_folder 切文件时主线程卡在 libvlc_media_player_stop 里不返回）。
         # 这个锁保证 stop() 会等当前正在跑的回调写完再拆流。
         #
-        # vosk 识别（_recognizer）只由 _rec_worker 这一个线程碰，不跟回调线程
+        # 识别流（_stream）只由 _rec_worker 这一个线程碰，不跟回调线程
         # 抢锁；stop() 先投递退出标记并 join _rec_thread，之后再安全置空。
         self._callback_lock = threading.Lock()
 
     def available(self):
+        if self.source_lang == "zh":
+            return all(os.path.isfile(p) for p in _sherpa_zh_paths().values())
         return bool(self.model_path) and os.path.isdir(self.model_path)
 
     def _load_model(self):
-        if self._model is None:
-            import vosk
-            vosk.SetLogLevel(-1)
-            self._model = vosk.Model(model_path=self.model_path)
+        if self._asr is None:
+            if self.source_lang == "zh":
+                paths = _sherpa_zh_paths()
+                self._asr = _SherpaASR(
+                    paths["tokens"], paths["encoder"], paths["decoder"], paths["joiner"],
+                    SAMPLE_RATE, SHERPA_ZH_NUM_THREADS,
+                    punct_model=_sherpa_punct_path(), punct_threads=PUNCT_ZH_NUM_THREADS)
+            else:
+                self._asr = _VoskASR(self.model_path, SAMPLE_RATE)
         if self.caption_mode in ("translate", "ai_translate") and self._translator is None and self.source_lang != "zh":
             try:
                 import translation_engine
@@ -144,7 +275,7 @@ class LiveCaptioner:
                 if self.caption_mode == "translate":
                     raise
                 self._translator = None  # ai_translate 模式下 Argos 只作兜底，缺失可继续
-        return self._model
+        return self._asr
 
     def start_async(self, player, stop_fn=None):
         """Non-blocking. Call poll() from the caller's own thread (the one
@@ -162,13 +293,20 @@ class LiveCaptioner:
         self._start_result = None
         self.error = None
         if not self.available():
-            self.error = (
-                "未找到 %s 字幕模型：%s（可设置环境变量 VOSK_MODEL_PATH_%s 指定路径）"
-                % (self.source_lang, self.model_path, self.source_lang.upper())
-            )
+            if self.source_lang == "zh":
+                self.error = (
+                    "未找到中文字幕模型（sherpa-onnx Zipformer）：请把模型放到 %s，"
+                    "或设置环境变量 SHERPA_MODEL_DIR_ZH 指定目录"
+                    % SHERPA_ZH_MODEL_DIR
+                )
+            else:
+                self.error = (
+                    "未找到 %s 字幕模型：%s（可设置环境变量 VOSK_MODEL_PATH_%s 指定路径）"
+                    % (self.source_lang, self.model_path, self.source_lang.upper())
+                )
             self._start_result = (False, self.error)
             return
-        if self._model is not None:
+        if self._asr is not None:
             self._finish_start()
             return
         if self._loading:
@@ -185,7 +323,7 @@ class LiveCaptioner:
             return self._start_result
         if self._loading:
             return None
-        if self._model is not None:
+        if self._asr is not None:
             self._finish_start()
         return self._start_result
 
@@ -202,26 +340,24 @@ class LiveCaptioner:
         player = self._pending_player
         try:
             import vlc
-            import vosk
             import sounddevice as sd
 
             # 若上次是透传关闭（stop(keep_audio=True)）残留了输出流，先关掉，
             # 避免重新开字幕时开出第二个 sounddevice 流。
             self._close_stream()
 
-            recognizer = vosk.KaldiRecognizer(self._model, SAMPLE_RATE)
-            recognizer.SetWords(False)
+            stream = self._asr.create_stream()
 
             play_cb = vlc.CallbackDecorators.AudioPlayCb(self._on_audio_play)
             flush_cb = vlc.CallbackDecorators.AudioFlushCb(self._on_audio_flush)
             _CALLBACK_KEEPALIVE.append(play_cb)
             _CALLBACK_KEEPALIVE.append(flush_cb)
 
-            self._recognizer = recognizer
+            self._stream = stream
             self._play_cb = play_cb
             self._flush_cb = flush_cb
 
-            # 识别线程：vosk 只在它自己的线程里跑，音频回调线程只负责把 PCM 丢进来。
+            # 识别线程：识别器只在它自己的线程里跑，音频回调线程只负责把 PCM 丢进来。
             self._pcm_queue = queue.Queue(maxsize=PCM_QUEUE_MAX)
             self._rec_thread = threading.Thread(target=self._rec_worker, daemon=True)
             self._rec_thread.start()
@@ -324,7 +460,7 @@ class LiveCaptioner:
         self._trans_thread = None
         if trans_thread is not None and trans_thread is not threading.current_thread():
             trans_thread.join(timeout=2.0)
-        # 通知识别线程退出并等它处理完当前这一帧 -- 之后才能安全置空 _recognizer。
+        # 通知识别线程退出并等它处理完当前这一帧 -- 之后才能安全置空 _stream。
         pcm_queue = self._pcm_queue
         rec_thread = self._rec_thread
         if pcm_queue is not None:
@@ -353,8 +489,8 @@ class LiveCaptioner:
             # 既不卡也不崩。
             if player is not None:
                 self._unbind_callbacks(player)
-        # _rec_worker 已 join 退出，此刻无人再碰 _recognizer，可安全置空。
-        self._recognizer = None
+        # _rec_worker 已 join 退出，此刻无人再碰 _stream，可安全置空。
+        self._stream = None
         while True:
             try:
                 self.queue.get_nowait()
@@ -411,28 +547,27 @@ class LiveCaptioner:
                 pass
 
     def _rec_worker(self):
-        """识别线程：独占 vosk recognizer，逐帧解码音频，结果写回字幕队列。
+        """识别线程：独占识别器（vosk 或 sherpa-onnx），逐帧解码音频，结果写回字幕队列。
 
-        音频回调线程和这个线程通过 _pcm_queue 解耦 -- 回调不碰 recognizer，
+        音频回调线程和这个线程通过 _pcm_queue 解耦 -- 回调不碰识别器，
         识别再慢也只会积压/丢帧，不会反过来拖慢音频回调导致出声滞后。
 
-        VLC 的音频回调一帧只有 ~26ms（约 42 次/秒），若每帧都调一次
-        AcceptWaveform，调用开销累积很高，视频软解 + 翻译 + UI 一起跑时识别
-        线程容易落后 → 丢帧 → 音频断档 → vosk 提前收句成「一两个字」。这里先
-        攒到约 100ms 再一次性喂给 vosk，把调用频率降到 ~10 次/秒，稳定跑赢实时。"""
+        VLC 的音频回调一帧只有 ~26ms（约 42 次/秒），若每帧都喂一次识别器，
+        调用开销累积很高，视频软解 + 翻译 + UI 一起跑时识别线程容易落后 →
+        丢帧 → 音频断档 → 识别器提前收句成「一两个字」。这里先攒到约 100ms
+        再一次性喂给识别器，把调用频率降到 ~10 次/秒，稳定跑赢实时。"""
         pcm_queue = self._pcm_queue
+        asr = self._asr
+        stream = self._stream
         acc = bytearray()
         target = SAMPLE_RATE * 2 * 100 // 1000  # 16000Hz*2字节*0.1s = 3200 字节
         while True:
             item = pcm_queue.get()
             if item is None:
                 break
-            recognizer = self._recognizer
-            if recognizer is None:
-                continue
             if item is _RESET:
                 try:
-                    recognizer.Reset()
+                    asr.reset(stream)
                 except Exception:
                     pass
                 acc = bytearray()
@@ -443,18 +578,18 @@ class LiveCaptioner:
             buf = bytes(acc)
             acc = bytearray()
             try:
-                if recognizer.AcceptWaveform(buf):
-                    text = json.loads(recognizer.Result()).get("text", "")
-                    if text:
-                        self._emit_final(text)
-                elif self.caption_mode == "original":
-                    # 翻译模式下不展示原文 partial，等一句说完直接出译文，
-                    # 避免字幕框里外语原文和中文译文来回跳。
-                    text = json.loads(recognizer.PartialResult()).get("partial", "")
-                    if text:
-                        self.queue.put(("partial", self._display_text(text, self.source_lang == "zh")))
+                event = asr.feed(stream, buf)
             except Exception:
-                pass
+                continue
+            if event is None:
+                continue
+            kind, text = event
+            if kind == "final":
+                self._emit_final(text)
+            elif kind == "partial" and self.caption_mode == "original":
+                # 翻译模式下不展示原文 partial，等一句说完直接出译文，
+                # 避免字幕框里外语原文和中文译文来回跳。
+                self.queue.put(("partial", self._display_text(text, self.source_lang == "zh")))
 
     def _emit_final(self, text):
         is_chinese = self.source_lang == "zh"
@@ -494,6 +629,6 @@ class LiveCaptioner:
 
     @staticmethod
     def _display_text(text, is_chinese):
-        # vosk 中文模型输出的是空格分词（"火箭 正在 飞向"），中文书面习惯不加
+        # 中文模型输出的是空格分词（"火箭 正在 飞向"），中文书面习惯不加
         # 空格，显示前去掉；英文/日文模型输出的词间空格要保留。
         return text.replace(" ", "") if is_chinese else text
