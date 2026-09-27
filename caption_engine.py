@@ -107,17 +107,38 @@ AI_PRESETS = {
 }
 
 
-def _llm_translate(text, cfg):
-    """OpenAI 兼容接口翻译成简体中文（阻塞调用，须在后台线程跑）。"""
+_SYSTEM_PROMPT = (
+    "你是字幕翻译，把输入内容翻译成简体中文。"
+    "如果提供了上文，请参考上文保持人名、称谓、专有名词的翻译前后一致。"
+    "只输出译文本身，不要解释、不要加引号或任何前缀。"
+)
+
+
+def _llm_translate(text, cfg, history=None):
+    """OpenAI 兼容接口翻译成简体中文（阻塞调用，须在后台线程跑）。
+
+    history: 可选 [(原文, 译文), ...]（按时间顺序），供模型参考上下文，
+    保持人名/术语/指代前后一致。"""
     key = (cfg.get("api_key") or "").strip()
     if not key:
         raise RuntimeError("未配置 AI 翻译 API Key")
+
+    user_content = text
+    if history:
+        parts = []
+        for i, (orig, trans) in enumerate(history, 1):
+            parts.append("%d. 原文：%s\n   译文：%s" % (i, orig, trans))
+        user_content = (
+            "上文（仅供参考，用于保持翻译一致）：\n"
+            + "\n".join(parts)
+            + "\n\n当前句原文：\n%s\n\n请只输出当前句的简体中文译文。" % text
+        )
+
     payload = {
         "model": (cfg.get("model") or "deepseek-chat").strip(),
         "messages": [
-            {"role": "system",
-             "content": "你是字幕翻译，把输入内容翻译成简体中文，只输出译文，不要解释。"},
-            {"role": "user", "content": text},
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
         ],
         "temperature": 0.2,
     }
@@ -248,7 +269,7 @@ class _SenseVoiceASR:
         vad_cfg = sherpa_onnx.VadModelConfig(
             silero_vad=sherpa_onnx.SileroVadModelConfig(
                 model=vad_model, threshold=0.5,
-                min_silence_duration=0.5, min_speech_duration=0.25,
+                min_silence_duration=0.6, min_speech_duration=0.25,
                 max_speech_duration=20),
             sample_rate=sample_rate, num_threads=num_threads)
         self._vad = sherpa_onnx.VoiceActivityDetector(vad_cfg, buffer_size_in_seconds=60)
@@ -685,8 +706,13 @@ class LiveCaptioner:
     def _trans_worker(self):
         """后台线程：消费待翻译句子，调 LLM / Argos，结果写回字幕队列。
         所有 ctranslate2 与 LLM 调用都集中在这里（Python 线程），保证不在
-        VLC 音频回调线程里碰这些原生库。"""
+        VLC 音频回调线程里碰这些原生库。
+
+        维护最近几句的 (原文, 译文) 历史，随每次请求一起发给 LLM，让它参考
+        上下文保持人名/称谓/术语/指代的前后一致——这是逐句独立翻译时最容易
+        出错的地方。"""
         trans_queue = self._trans_queue
+        history = []  # [(原文, 译文), ...]，只保留最近 3 句
         while True:
             item = trans_queue.get()
             if item is None:
@@ -695,7 +721,7 @@ class LiveCaptioner:
             translated = None
             if self.caption_mode == "ai_translate" and self.ai_cfg.get("api_key"):
                 try:
-                    translated = _llm_translate(text, self.ai_cfg)
+                    translated = _llm_translate(text, self.ai_cfg, history=history)
                 except Exception:
                     translated = None
             if not translated and self._translator is not None:
@@ -704,8 +730,13 @@ class LiveCaptioner:
                 except Exception:
                     translated = None
             if translated:
-                self.queue.put(("final", self._display_text(translated, True)))
+                final = self._display_text(translated, True)
+                history.append((text, final))
+                if len(history) > 3:
+                    history.pop(0)
+                self.queue.put(("final", final))
             else:
+                # 翻译失败/缺失时回退原声；失败句不进历史，避免污染上下文。
                 self.queue.put(("final", self._display_text(text, is_chinese)))
 
     @staticmethod
