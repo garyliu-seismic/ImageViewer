@@ -296,6 +296,24 @@ class ComicViewer(tk.Tk):
         self._repeat_playlist = bool(video_cfg.get("repeat_playlist", False))
         self._shuffle_playlist = bool(video_cfg.get("shuffle_playlist", False))
         self._video_zoom = clamp(float(video_cfg.get("zoom", 1.0)), 0.5, 4.0)
+        self._video_fs_fit = True   # 全屏时自动铺满（scale=0 自适应），手动缩放会临时覆盖
+        self._video_rotation = int(video_cfg.get("rotation", 0)) % 360   # 视频旋转角度 0/90/180/270
+        adj = video_cfg.get("adjust", {}) or {}
+        self._video_adjust = {
+            "brightness": clamp(float(adj.get("brightness", 1.0)), 0.0, 2.0),
+            "contrast": clamp(float(adj.get("contrast", 1.0)), 0.0, 2.0),
+            "hue": clamp(float(adj.get("hue", 0.0)), -180.0, 180.0),
+            "saturation": clamp(float(adj.get("saturation", 1.0)), 0.0, 3.0),
+            "gamma": clamp(float(adj.get("gamma", 1.0)), 0.01, 10.0),
+        }
+        # 视频局部放大（区域放大）状态
+        self._region_zoom = False   # 区域放大模式开关（Z 切换）
+        self._rz_cx = 0.5           # 放大框中心 x（归一化 0..1）
+        self._rz_cy = 0.5           # 放大框中心 y（归一化 0..1）
+        self._rz_scale = 0.5        # 放大框边长占视频比例（越小越放大）
+        self._rz_drag = None        # 拖拽中的起始状态
+        self._rz_panel = None       # 区域放大控制面板（Toplevel）
+        self._transparent_ticks = 0  # 播放初期重试鼠标穿透的计数
         self._video_cache = {}
         self._tmp_dir = tempfile.mkdtemp(prefix="image_viewer_")
 
@@ -510,6 +528,9 @@ class ComicViewer(tk.Tk):
         view.add_command(label="画面放大 +25%", command=lambda: self.change_video_zoom(0.25))
         view.add_command(label="画面缩小 -25%", command=lambda: self.change_video_zoom(-0.25))
         view.add_command(label="重置画面缩放", command=self.reset_video_zoom)
+        view.add_command(label="区域放大 开/关", command=self.toggle_region_zoom, accelerator="Z")
+        view.add_command(label="画面调节（亮度/对比度…）", command=self.open_video_adjust, accelerator="E")
+        view.add_command(label="重置画面调节", command=self.reset_video_adjust)
         view.add_command(label="字幕位置 顶部/底部", command=self.toggle_caption_pos)
         view.add_separator()
         view.add_command(label="投屏到电视 / 设备", command=self.toggle_cast)
@@ -602,7 +623,9 @@ class ComicViewer(tk.Tk):
         # 视频页：滚轮 / 触控板手势 / 单击
         self.bind_all("<MouseWheel>", self._on_video_wheel)
         self.bind_all("<Shift-MouseWheel>", self._on_video_hwheel)
-        self.video_panel.bind("<Button-1>", self._on_video_click)
+        self.video_panel.bind("<ButtonPress-1>", self._on_video_press)
+        self.video_panel.bind("<B1-Motion>", self._on_video_motion)
+        self.video_panel.bind("<ButtonRelease-1>", self._on_video_release)
 
     # ---------------- 配置 / 断点续读 ----------------
     def _load_config(self):
@@ -1145,12 +1168,19 @@ class ComicViewer(tk.Tk):
             # 打开另一个视频，卡死在 libvlc_media_player_stop）。GDI 纯 CPU 渲染
             # 不经过 GPU 驱动，绕开这个死锁；代价是高清视频软渲染更吃 CPU，但
             # 漫画里的短视频通常够用。
-            self.vlc_instance = vlc.Instance([
+            args = [
                 "--avcodec-hw=none", "--vout=wingdi",
                 # 不接管鼠标/键盘事件：让滚轮 / 触控板手势 / 快捷键传到 Tk
                 # （否则 VLC 会把 F=全屏、空格=暂停、回车=导航、滚轮=音量 都自己吃掉）
                 "--no-mouse-events", "--no-keyboard-events",
-            ])
+            ]
+            # 视频旋转：transform 滤镜必须是 Instance 级选项（media 级 :video-filter
+            # 在本机 VLC 3.0.20 + set_hwnd 下不会被 vout 继承，实测无效）。
+            # 角度改变时重建实例。
+            if self._video_rotation:
+                args.append("--video-filter=transform")
+                args.append("--transform-type=%d" % self._video_rotation)
+            self.vlc_instance = vlc.Instance(args)
             self.player = self.vlc_instance.media_player_new()
             return True
         except Exception:
@@ -1191,6 +1221,9 @@ class ComicViewer(tk.Tk):
         self._video_ended = False
         self._ab_start_ms = None
         self._ab_end_ms = None
+        self._region_zoom = False
+        self._hide_rz_panel()
+        self._transparent_ticks = 0
         self._resume_seek_ms = self._get_resume_position(src)
         # 打开新视频时按文件名自动加载外接字幕；速率在用户调整后持久化
         self._load_subtitle_for(self.sources[self.index])
@@ -1216,11 +1249,15 @@ class ComicViewer(tk.Tk):
             self._apply_rate_now()
             self.player.audio_set_volume(int(self.vol.get()))
             self.is_video = True
-            self._apply_video_zoom()
+            self._apply_region_zoom()   # 清掉上一段视频残留的裁剪框，再按 zoom/区域放大应用
+            self._apply_video_adjust()
             self.play_btn.configure(text="⏸")
             # VLC 的原生视频窗口会抢走键盘/滚轮焦点，导致快捷键和触控板手势失效；
             # 等它播放起来后把焦点拉回 Tk 主窗口，事件才会走我们的分发。
             self.after(300, self._refocus_main)
+            # 把 VLC 原生子窗口设为鼠标穿透，否则画面上的点击/拖拽传不到 Tk。
+            self.after(400, self._make_video_window_transparent)
+            self.after(1200, self._make_video_window_transparent)
         except Exception as e:
             self.is_video = False
             self.status.configure(text="视频播放失败：%s" % e)
@@ -1233,6 +1270,76 @@ class ComicViewer(tk.Tk):
         """视频播放后把键盘焦点从 VLC 原生窗口拉回 Tk 主窗口。"""
         try:
             self.focus_force()
+        except Exception:
+            pass
+
+    def _make_video_window_transparent(self):
+        """把 VLC 的原生视频子窗口设为鼠标穿透。
+
+        set_hwnd 后 VLC 会在 video_panel 里创建原生子窗口画视频，该窗口会吞掉
+        落在画面上的鼠标事件（--no-mouse-events 只影响键盘/滚轮焦点，不会让窗口
+        鼠标穿透）。这里做两件事：
+          1) 设 WS_EX_TRANSPARENT（影响绘制顺序，辅助穿透）；
+          2) 子类化每个子窗口的 WndProc，WM_NCHITTEST 返回 HTTRANSPARENT，
+             让鼠标命中测试穿透到下层 Tk 窗口，从而点击/拖拽能传到 video_panel。
+        """
+        if not self.is_video:
+            return
+        try:
+            hwnd = self.video_panel.winfo_id()
+            if not hwnd:
+                return
+            user32 = ctypes.windll.user32
+            GW_CHILD = 5
+            GW_HWNDNEXT = 2
+            GWL_EXSTYLE = -20
+            WS_EX_TRANSPARENT = 0x00000020
+            GWLP_WNDPROC = -4
+            WM_NCHITTEST = 0x0084
+            HTTRANSPARENT = -1
+
+            user32.GetWindow.restype = ctypes.c_void_p
+            user32.GetWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            user32.GetWindowLongW.restype = ctypes.c_long
+            user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            user32.SetWindowLongW.restype = ctypes.c_long
+            user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+            user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+            user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+            user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+            user32.CallWindowProcW.restype = ctypes.c_ssize_t
+            user32.CallWindowProcW.argtypes = [ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
+                                               ctypes.c_ssize_t, ctypes.c_ssize_t]
+
+            WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
+                                         ctypes.c_ssize_t, ctypes.c_ssize_t)
+            hooks = getattr(self, "_wndproc_hooks", None)
+            if hooks is None:
+                hooks = {}
+                self._wndproc_hooks = hooks
+
+            def walk(h):
+                cur = user32.GetWindow(h, GW_CHILD)
+                while cur:
+                    st = user32.GetWindowLongW(cur, GWL_EXSTYLE)
+                    user32.SetWindowLongW(cur, GWL_EXSTYLE, st | WS_EX_TRANSPARENT)
+                    if cur not in hooks:
+                        old_proc = user32.GetWindowLongPtrW(cur, GWLP_WNDPROC)
+                        if old_proc:
+                            def make_proc(old):
+                                def proc(hw, msg, wp, lp):
+                                    if msg == WM_NCHITTEST:
+                                        return HTTRANSPARENT
+                                    return user32.CallWindowProcW(old, hw, msg, wp, lp)
+                                return WNDPROC(proc)
+                            cb = make_proc(old_proc)
+                            user32.SetWindowLongPtrW(cur, GWLP_WNDPROC,
+                                                     ctypes.cast(cb, ctypes.c_void_p).value)
+                            hooks[cur] = (old_proc, cb)
+                    walk(cur)
+                    cur = user32.GetWindow(cur, GW_HWNDNEXT)
+            walk(hwnd)
         except Exception:
             pass
 
@@ -1272,18 +1379,26 @@ class ComicViewer(tk.Tk):
             "repeat_playlist": self._repeat_playlist,
             "shuffle_playlist": self._shuffle_playlist,
             "zoom": self._video_zoom,
+            "rotation": self._video_rotation,
+            "adjust": dict(self._video_adjust),
         })
         self._save_config()
 
     def zoom_in(self):
         if self.is_video:
-            self.change_video_zoom(0.25)
+            if self._region_zoom:
+                self._rz_zoom_step(-0.1)
+            else:
+                self.change_video_zoom(0.25)
         else:
             self.zoom_center(1.25)
 
     def zoom_out(self):
         if self.is_video:
-            self.change_video_zoom(-0.25)
+            if self._region_zoom:
+                self._rz_zoom_step(0.1)
+            else:
+                self.change_video_zoom(-0.25)
         else:
             self.zoom_center(0.8)
 
@@ -1291,12 +1406,16 @@ class ComicViewer(tk.Tk):
         if self._cast_mode == "dlna":
             return  # DLNA 投屏不支持画面缩放
         self._video_zoom = clamp(round(self._video_zoom + delta, 2), 0.5, 4.0)
+        if self.attributes("-fullscreen"):
+            self._video_fs_fit = False  # 全屏下手动缩放时改用显式倍率，不再自动铺满
         self._apply_video_zoom()
         self._save_video_options()
         self._update_status()
 
     def reset_video_zoom(self):
         self._video_zoom = 1.0
+        if self.attributes("-fullscreen"):
+            self._video_fs_fit = False
         self._apply_video_zoom()
         self._save_video_options()
         self._update_status()
@@ -1305,9 +1424,209 @@ class ComicViewer(tk.Tk):
         if not self.player or not self.is_video or self._video_is_stopping():
             return
         try:
-            self.player.video_set_scale(self._video_zoom)
+            # 区域放大：裁剪框由 _apply_region_zoom 设置，这里 scale=0 让裁剪区铺满。
+            if self._region_zoom:
+                self.player.video_set_scale(0)
+            # 全屏下默认自动铺满：scale=0 让 libVLC 按屏幕自适应（保持比例、完整显示）。
+            # 用户在全屏里手动 +/− 缩放后 _video_fs_fit 变 False，改用显式倍率。
+            elif self.attributes("-fullscreen") and self._video_fs_fit:
+                self.player.video_set_scale(0)
+            else:
+                self.player.video_set_scale(self._video_zoom)
         except Exception:
             pass
+
+    def _clamp_rz_center(self):
+        lo = self._rz_scale / 2.0
+        hi = 1.0 - lo
+        self._rz_cx = clamp(self._rz_cx, lo, hi)
+        self._rz_cy = clamp(self._rz_cy, lo, hi)
+
+    def _apply_region_zoom(self):
+        """区域放大：用裁剪框 crop 出局部区域再铺满；关闭时清除裁剪。"""
+        if not self.player or not self.is_video or self._video_is_stopping():
+            return
+        try:
+            if self._region_zoom:
+                w, h = self.player.video_get_size()
+                if w <= 0 or h <= 0:
+                    return
+                box_w = max(1, int(round(w * self._rz_scale)))
+                box_h = max(1, int(round(h * self._rz_scale)))
+                self._clamp_rz_center()
+                x = int(round(self._rz_cx * w - box_w / 2.0))
+                y = int(round(self._rz_cy * h - box_h / 2.0))
+                # 裁剪格式（实测）："WxH+X+Y" 中 W/H 是右下角坐标，X/Y 是左上角坐标，
+                # 即裁剪矩形 = [X, W] x [Y, H]。所以右下角要传 x+box_w / y+box_h。
+                self.player.video_set_crop_geometry("%dx%d+%d+%d" % (x + box_w, y + box_h, x, y))
+            else:
+                self.player.video_set_crop_geometry("")
+            self._apply_video_zoom()
+        except Exception:
+            pass
+
+    def toggle_region_zoom(self):
+        if not self.is_video or self._cast_mode == "dlna":
+            return
+        self._region_zoom = not self._region_zoom
+        if self._region_zoom:
+            self._rz_cx = self._rz_cy = 0.5
+            self._rz_scale = 0.5
+            self._show_rz_panel()
+            self._apply_region_zoom()
+            self._update_status()
+            self.status.configure(text="区域放大：方向键 / WASD 平移 · 滚轮 / +- 缩放 · 面板按钮也可用 · Z 退出")
+        else:
+            self._hide_rz_panel()
+            self._apply_region_zoom()
+            self._update_status()
+
+    def _rz_zoom_step(self, d_scale):
+        self._rz_scale = clamp(round(self._rz_scale + d_scale, 2), 0.1, 1.0)
+        self._clamp_rz_center()
+        self._apply_region_zoom()
+        self._update_status()
+
+    def _rz_reset_center(self):
+        self._rz_cx = self._rz_cy = 0.5
+        self._clamp_rz_center()
+        self._apply_region_zoom()
+        self._update_status()
+
+    def _rz_pan(self, dx, dy):
+        self._rz_cx += dx * 0.08
+        self._rz_cy += dy * 0.08
+        self._clamp_rz_center()
+        self._apply_region_zoom()
+        self._update_status()
+
+    def _show_rz_panel(self):
+        """弹出区域放大控制面板（独立 Toplevel，按钮不依赖视频区的鼠标事件）。"""
+        p = getattr(self, "_rz_panel", None)
+        if p is not None:
+            try:
+                if p.winfo_exists():
+                    p.lift()
+                    return
+            except Exception:
+                pass
+        win = tk.Toplevel(self)
+        win.title("区域放大")
+        win.configure(bg="#1a1d24")
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        self._rz_panel = win
+
+        def mk(txt, cmd, w=2):
+            return tk.Button(win, text=txt, command=cmd, width=w, takefocus=0,
+                             bg=BTN_BG, fg=FG, activebackground=BTN_ACTIVE, activeforeground="#fff",
+                             relief="flat", bd=0, pady=6, font=("Microsoft YaHei", 11),
+                             cursor="hand2")
+
+        grid = tk.Frame(win, bg="#1a1d24")
+        grid.pack(padx=8, pady=8)
+        mk("↑", lambda: self._rz_pan(0, -1)).grid(row=0, column=1, padx=2, pady=2)
+        mk("←", lambda: self._rz_pan(-1, 0)).grid(row=1, column=0, padx=2, pady=2)
+        mk("·", None, w=2).grid(row=1, column=1, padx=2, pady=2)
+        mk("→", lambda: self._rz_pan(1, 0)).grid(row=1, column=2, padx=2, pady=2)
+        mk("↓", lambda: self._rz_pan(0, 1)).grid(row=2, column=1, padx=2, pady=2)
+        mk("＋", lambda: self._rz_zoom_step(-0.1), w=2).grid(row=0, column=3, padx=2, pady=2)
+        mk("－", lambda: self._rz_zoom_step(0.1), w=2).grid(row=1, column=3, padx=2, pady=2)
+        row2 = tk.Frame(win, bg="#1a1d24")
+        row2.pack(pady=(0, 8))
+        mk("居中", lambda: self._rz_reset_center(), w=4).pack(side="left", padx=4)
+        mk("退出", lambda: self.toggle_region_zoom(), w=4).pack(side="left", padx=4)
+
+        win.update_idletasks()
+        try:
+            x = self.video_panel.winfo_rootx() + self.video_panel.winfo_width() - win.winfo_reqwidth() - 24
+            y = self.video_panel.winfo_rooty() + self.video_panel.winfo_height() - win.winfo_reqheight() - 24
+            win.geometry("+%d+%d" % (max(0, x), max(0, y)))
+        except Exception:
+            pass
+
+    def _hide_rz_panel(self):
+        p = getattr(self, "_rz_panel", None)
+        if p is not None:
+            try:
+                p.destroy()
+            except Exception:
+                pass
+            self._rz_panel = None
+
+    def _apply_video_adjust(self):
+        """把亮度/对比度/饱和度/色相/伽马应用到 VLC（浮点版，默认 1.0）。"""
+        if not self.player or not self.is_video or self._video_is_stopping():
+            return
+        try:
+            B = self.vlc.VideoAdjustOption
+            a = self._video_adjust
+            self.player.video_set_adjust_float(B.Brightness, a["brightness"])
+            self.player.video_set_adjust_float(B.Contrast, a["contrast"])
+            self.player.video_set_adjust_float(B.Hue, a["hue"])
+            self.player.video_set_adjust_float(B.Saturation, a["saturation"])
+            self.player.video_set_adjust_float(B.Gamma, a["gamma"])
+        except Exception:
+            pass
+
+    def reset_video_adjust(self):
+        self._video_adjust = {"brightness": 1.0, "contrast": 1.0, "hue": 0.0,
+                              "saturation": 1.0, "gamma": 1.0}
+        self._apply_video_adjust()
+        self._save_video_options()
+        self._update_status()
+
+    def open_video_adjust(self):
+        """弹出画面调节对话框：亮度/对比度/饱和度/色相/伽马滑块，实时预览。"""
+        if not self.is_video:
+            return
+        win = tk.Toplevel(self)
+        win.title("画面调节（亮度 / 对比度 / 饱和度 / 色相 / 伽马）")
+        win.configure(bg="#1a1d24")
+        win.transient(self)
+        win.resizable(False, False)
+        items = [
+            ("brightness", "亮度", 0.0, 2.0, 0.05),
+            ("contrast", "对比度", 0.0, 2.0, 0.05),
+            ("saturation", "饱和度", 0.0, 3.0, 0.05),
+            ("hue", "色相", -180.0, 180.0, 5.0),
+            ("gamma", "伽马", 0.1, 3.0, 0.05),
+        ]
+        vars_ = {}
+        for key, label, lo, hi, res in items:
+            row = tk.Frame(win, bg="#1a1d24")
+            row.pack(fill="x", padx=18, pady=7)
+            tk.Label(row, text=label, width=6, bg="#1a1d24", fg=FG,
+                     anchor="w", font=("Microsoft YaHei", 10)).pack(side="left")
+            var = tk.DoubleVar(value=self._video_adjust[key])
+            vars_[key] = var
+            def on_change(val, key=key):
+                try:
+                    self._video_adjust[key] = float(val)
+                except Exception:
+                    return
+                self._apply_video_adjust()
+            tk.Scale(row, from_=lo, to=hi, resolution=res, orient="horizontal",
+                     variable=var, command=on_change, showvalue=True,
+                     bg="#2a2f38", fg=FG, troughcolor="#3a3f47",
+                     activebackground="#5b9aff", highlightthickness=0,
+                     length=300).pack(side="left", fill="x", expand=True)
+        btns = tk.Frame(win, bg="#1a1d24")
+        btns.pack(pady=(6, 14))
+        def do_reset():
+            self.reset_video_adjust()
+            for key, var in vars_.items():
+                var.set(self._video_adjust[key])
+        def save_and_close():
+            self._save_video_options()
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", save_and_close)
+        tk.Button(btns, text="重置", command=do_reset, bg=BTN_BG, fg=FG,
+                  activebackground=BTN_ACTIVE, relief="flat", padx=14, pady=6,
+                  cursor="hand2").pack(side="left", padx=8)
+        tk.Button(btns, text="关闭", command=save_and_close, bg=BTN_BG, fg=FG,
+                  activebackground=BTN_ACTIVE, relief="flat", padx=14, pady=6,
+                  cursor="hand2").pack(side="left", padx=8)
 
     def toggle_ab_repeat(self):
         if not self.is_video:
@@ -1722,6 +2041,8 @@ class ComicViewer(tk.Tk):
         # 而直接返回，避免在后台 stop 进行中误触 player。
         self._save_resume_position()
         self.is_video = False
+        self._region_zoom = False
+        self._hide_rz_panel()
         self._stop_captions()
         self._stop_player()
         self._hide_video_bar()
@@ -2038,6 +2359,12 @@ class ComicViewer(tk.Tk):
         except Exception:
             pass
         self._video_timer = self.after(500, self._update_video_time_loop)
+
+        # 播放初期持续把 VLC 原生窗口设为鼠标穿透（窗口可能延迟创建，每 ~1s 重试）
+        if self._transparent_ticks < 16:
+            self._transparent_ticks += 1
+            if self._transparent_ticks % 2 == 0:
+                self._make_video_window_transparent()
 
         # 刷新视频条上的字幕/速率按钮状态（~2Hz，轻量，避免手动在各处重绘）
         try:
@@ -2455,11 +2782,49 @@ class ComicViewer(tk.Tk):
             self.show_file(max(self.index - 1, 0))
 
     def rotate(self, d):
+        if self.is_video:
+            self._rotate_video(d)
+            return
         if not self.orig:
             return
         self.rotation = (self.rotation + d) % 360
         self._clamp_pan()
         self._render()
+
+    def _rotate_video(self, d):
+        """旋转视频：transform 滤镜是 Instance 级选项，改角度需重建 VLC 实例。"""
+        if self._cast_mode == "dlna":
+            return  # DLNA 投屏不支持本地旋转
+        self._video_rotation = (self._video_rotation + d) % 360
+        self._save_video_options()
+        if self.is_video:
+            self._save_resume_position()  # 记住当前位置，重开后断点续播
+            self._recreate_vlc()
+            self._show_video(self.sources[self.index])
+
+    def _recreate_vlc(self):
+        """停掉并释放旧 player/实例，按新的旋转角度重建 VLC。"""
+        stop_done = True
+        if self.player is not None:
+            self._stop_player()
+            # stop 超时（D3D11 收尾死锁兜底）时不强行 release，避免 use-after-free；
+            # 旧实例交给后台 stop 线程收尾，这里只丢弃引用。
+            stop_done = (self._stop_event is not None and self._stop_event.is_set())
+            if stop_done:
+                try:
+                    self.player.release()
+                except Exception:
+                    pass
+            self.player = None
+        if self.vlc_instance is not None:
+            if stop_done:
+                try:
+                    self.vlc_instance.release()
+                except Exception:
+                    pass
+            self.vlc_instance = None
+        self.vlc = None
+        self._ensure_vlc()
 
     def set_fit(self, mode):
         if not self.orig:
@@ -2687,10 +3052,12 @@ class ComicViewer(tk.Tk):
         entering_fullscreen = not self.attributes("-fullscreen")
         self.attributes("-fullscreen", entering_fullscreen)
         if entering_fullscreen:
+            self._video_fs_fit = True  # 每次进入全屏都重新自动铺满
             self._hide_ui()
         else:
             self._show_ui()
         if self.is_video and self.player:
+            self._apply_region_zoom()
             # 全屏切换后，视频可能不自动适应新尺寸，稍后重设一次 hwnd 让 VLC 重新适配
             self.after(250, self._refresh_video_hwnd)
             # 字幕窗口是独立置顶 Toplevel，全屏会打乱 z-order，重新置顶抬升
@@ -2701,8 +3068,11 @@ class ComicViewer(tk.Tk):
                 and self.video_panel.winfo_manager()):
             try:
                 self.player.set_hwnd(self.video_panel.winfo_id())
+                self._apply_region_zoom()  # set_hwnd 后重新应用裁剪/缩放，确保铺满与区域放大不丢失
             except Exception:
                 pass
+            # set_hwnd 重建原生子窗口后，重新设为鼠标穿透
+            self.after(300, self._make_video_window_transparent)
 
     def toggle_thumbs(self):
         if self._thumbs_visible:
@@ -2852,10 +3222,13 @@ class ComicViewer(tk.Tk):
             (self.next if forward else self.prev)()
 
     def _on_video_wheel(self, e):
-        # 视频页：触控板上下滑 / 滚轮 => 音量（捏合 Ctrl+滚轮对视频无意义，忽略）
+        # 视频页：滚轮 => 音量；区域放大模式下 => 缩放放大框大小
         if e.state & 0x0004:
             return
-        self._apply_video_wheel(e.delta)
+        if self._region_zoom:
+            self._rz_zoom_step(-0.1 if e.delta > 0 else 0.1)
+        else:
+            self._apply_video_wheel(e.delta)
 
     def _apply_video_wheel(self, delta):
         if not self.is_video:
@@ -2900,10 +3273,46 @@ class ComicViewer(tk.Tk):
         except Exception:
             pass
 
-    def _on_video_click(self, e):
-        # 视频页：单击画面 => 播放 / 暂停
-        if self.is_video:
+    def _on_video_press(self, e):
+        # 区域放大模式：开始拖拽平移放大框；否则单击 => 播放 / 暂停
+        if not self.is_video:
+            return
+        if self._region_zoom:
+            self._rz_drag = dict(x=e.x, y=e.y, cx=self._rz_cx, cy=self._rz_cy, moved=False)
+        else:
             self._toggle_play()
+
+    def _on_video_motion(self, e):
+        if not (self.is_video and self._region_zoom and self._rz_drag):
+            return
+        dx = e.x - self._rz_drag["x"]
+        dy = e.y - self._rz_drag["y"]
+        if abs(dx) + abs(dy) > 3:
+            self._rz_drag["moved"] = True
+        pw = max(self.video_panel.winfo_width(), 1)
+        ph = max(self.video_panel.winfo_height(), 1)
+        self._rz_cx = self._rz_drag["cx"] + dx / pw
+        self._rz_cy = self._rz_drag["cy"] + dy / ph
+        self._clamp_rz_center()
+        self._apply_region_zoom()
+
+    def _on_video_release(self, e):
+        self._rz_drag = None
+
+    def _rz_pan_key(self, k):
+        """区域放大模式下用方向键 / WASD 平移放大框（键盘可靠，不受 VLC 原生窗口影响）。"""
+        step = 0.1
+        if k in ("Left", "a", "A"):
+            self._rz_cx -= step
+        elif k in ("Right", "d", "D"):
+            self._rz_cx += step
+        elif k in ("Up", "w", "W"):
+            self._rz_cy -= step
+        elif k in ("Down", "s", "S"):
+            self._rz_cy += step
+        self._clamp_rz_center()
+        self._apply_region_zoom()
+        self._update_status()
 
     def _on_key(self, e):
         w = self.focus_get()
@@ -2911,7 +3320,9 @@ class ComicViewer(tk.Tk):
         if isinstance(w, (tk.Entry, tk.Text)) and w.winfo_toplevel() is not self:
             return
         k = e.keysym
-        if self.is_video and k in ("Left", "Right"):
+        if self.is_video and self._region_zoom and k in ("Left", "Right", "Up", "Down", "w", "W", "a", "A", "s", "S", "d", "D"):
+            self._rz_pan_key(k)
+        elif self.is_video and k in ("Left", "Right"):
             self._seek_relative((30 if (e.state & 0x0004) else 5) * (1 if k == "Right" else -1))
         elif k in ("Right", "Next"):
             self.next()
@@ -2950,6 +3361,11 @@ class ComicViewer(tk.Tk):
         elif k in ("p", "P", "Print"):
             if self.is_video:
                 self._video_screenshot()
+        elif k in ("e", "E"):
+            if self.is_video:
+                self.open_video_adjust()
+        elif k in ("z", "Z"):
+            self.toggle_region_zoom()
         elif k in ("a", "A"):
             self.toggle_auto()
         elif k == "bracketleft":
@@ -3193,7 +3609,9 @@ class ComicViewer(tk.Tk):
             "视频页：空格 / 点击画面中间      播放 / 暂停\n"
             "视频页：P / 截图按钮             截图（多帧合成，更清晰）\n"
             "视频页：播放完自动              跳到下一张\n"
-            "R / Shift+R                    顺时针 / 逆时针旋转 90°\n"
+            "R / Shift+R                    旋转 90°（图片与视频都支持）\n"
+            "E                              视频：画面调节（亮度/对比度/饱和度/色相/伽马）\n"
+            "Z                              视频：区域放大（方向键/WASD 平移，滚轮/+/- 缩放，再按 Z 退出）\n"
             "0 / 1 / 2 / 3                  适应窗口 / 实际大小 / 适应宽度 / 适应高度\n"
             "D                              双页模式 开 / 关（竖图并排显示两张）\n"
             "M                              阅读方向 左→右 / 右→左（日漫）\n"
