@@ -452,11 +452,18 @@ class ComicViewer(tk.Tk):
                                                values=CAPTION_LANGS, state="readonly", width=5)
         self.caption_lang_combo.pack(side="left", padx=(8, 2))
         self.caption_lang_combo.bind("<<ComboboxSelected>>", self._on_caption_lang_change)
+        # 当视频的区域放大模式开启时，阻止语言下拉框使用上下键切换项，
+        # 改为把上下键路由为放大框的平移操作。
+        self.caption_lang_combo.bind("<Up>", lambda e: (self._rz_pan_key("Up"), "break")[1] if (self.is_video and self._region_zoom) else None)
+        self.caption_lang_combo.bind("<Down>", lambda e: (self._rz_pan_key("Down"), "break")[1] if (self.is_video and self._region_zoom) else None)
         self.caption_mode_var = tk.StringVar(value="原声")
         self.caption_mode_combo = ttk.Combobox(self.video_bar, textvariable=self.caption_mode_var,
                                                values=CAPTION_MODES, state="readonly", width=9)
         self.caption_mode_combo.pack(side="left", padx=2)
         self.caption_mode_combo.bind("<<ComboboxSelected>>", self._on_caption_mode_change)
+        # 同样阻止模式下拉框上下键干扰区域放大平移
+        self.caption_mode_combo.bind("<Up>", lambda e: (self._rz_pan_key("Up"), "break")[1] if (self.is_video and self._region_zoom) else None)
+        self.caption_mode_combo.bind("<Down>", lambda e: (self._rz_pan_key("Down"), "break")[1] if (self.is_video and self._region_zoom) else None)
         self.cast_btn = self._state_btn(self.video_bar, "📺 投屏", self.toggle_cast)
         self.shot_btn = self._state_btn(self.video_bar, "📷 截图", self._video_screenshot)
 
