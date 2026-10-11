@@ -9,6 +9,8 @@ VLC 播放器的完整门面（封装播放/缩放/区域放大/鼠标穿透等�
 import os
 import hashlib
 
+from viewer_core import clamp, clamp_rz_center, build_crop_geometry
+
 
 def fmt_time(ms):
     """毫秒 -> "m:ss" 显示文本。"""
@@ -54,3 +56,46 @@ def video_resume_key(src):
     if isinstance(src, tuple):
         return None
     return os.path.normcase(os.path.abspath(src))
+
+
+class RegionZoom:
+    """视频区域放大（Z 键）的纯状态 + 数学，无 UI / 无 VLC 依赖。
+
+    从 ComicViewer 抽出来，便于单测：开关、放大框中心 (cx, cy)（归一化 0..1）、
+    放大框边长占视频比例 scale（越小越放大）。应用到 VLC 的裁剪/缩放在
+    ComicViewer._apply_region_zoom 里完成。
+    """
+
+    def __init__(self):
+        self.enabled = False
+        self.cx = 0.5       # 放大框中心 x（归一化 0..1）
+        self.cy = 0.5       # 放大框中心 y（归一化 0..1）
+        self.scale = 0.5    # 放大框边长占视频比例（越小越放大）
+
+    def reset(self):
+        """回到初始状态：居中、边长 50%（开启区域放大时调用）。"""
+        self.cx = self.cy = 0.5
+        self.scale = 0.5
+
+    def clamp_center(self):
+        """把中心钳制在 [scale/2, 1-scale/2] 内，保证放大框不出界。"""
+        self.cx, self.cy = clamp_rz_center(self.cx, self.cy, self.scale)
+
+    def pan(self, dx, dy):
+        self.cx += dx
+        self.cy += dy
+        self.clamp_center()
+
+    def zoom_step(self, d):
+        """调整放大框边长比例；d<0 放大（框更小），d>0 缩小。"""
+        self.scale = clamp(round(self.scale + d, 2), 0.1, 1.0)
+        self.clamp_center()
+
+    def reset_center(self):
+        self.cx = self.cy = 0.5
+        self.clamp_center()
+
+    def crop_geometry(self, w, h):
+        """生成 VLC 裁剪字符串（含钳制中心）。"""
+        self.clamp_center()
+        return build_crop_geometry(w, h, self.cx, self.cy, self.scale)

@@ -98,12 +98,9 @@ class SmokeTest(unittest.TestCase):
     def test_region_zoom_crop_string(self):
         self._load_image()
         app = self.app
-        app._rz_scale = 0.5
-        app._rz_cx = app._rz_cy = 0.5
-        app._clamp_rz_center()
+        app.rz.reset()
         # 模拟 320x180 视频：裁剪字符串应为「右下角x右下角+左上角+左上角」
-        self.assertEqual(core.build_crop_geometry(320, 180, app._rz_cx, app._rz_cy, 0.5),
-                         "240x135+80+45")
+        self.assertEqual(app.rz.crop_geometry(320, 180), "240x135+80+45")
 
     def test_clamp_pan_after_refactor(self):
         self._load_image()

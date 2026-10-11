@@ -77,5 +77,41 @@ class TestVideoResumeKey(unittest.TestCase):
         self.assertEqual(key, os.path.normcase(os.path.abspath("C:/Videos/x.mp4")))
 
 
+class TestRegionZoom(unittest.TestCase):
+    def test_initial_state(self):
+        rz = vp.RegionZoom()
+        self.assertFalse(rz.enabled)
+        self.assertEqual((rz.cx, rz.cy, rz.scale), (0.5, 0.5, 0.5))
+
+    def test_reset(self):
+        rz = vp.RegionZoom()
+        rz.cx, rz.cy, rz.scale = 0.1, 0.9, 0.2
+        rz.reset()
+        self.assertEqual((rz.cx, rz.cy, rz.scale), (0.5, 0.5, 0.5))
+
+    def test_pan_clamps_to_bounds(self):
+        rz = vp.RegionZoom()  # scale=0.5 => 中心范围 [0.25, 0.75]
+        rz.pan(10, -10)
+        self.assertEqual((rz.cx, rz.cy), (0.75, 0.25))
+
+    def test_zoom_step_clamps_scale(self):
+        rz = vp.RegionZoom()
+        for _ in range(20):
+            rz.zoom_step(-0.1)   # 一直放大
+        self.assertAlmostEqual(rz.scale, 0.1)
+        for _ in range(20):
+            rz.zoom_step(0.1)    # 一直缩小
+        self.assertAlmostEqual(rz.scale, 1.0)
+
+    def test_crop_geometry_center(self):
+        rz = vp.RegionZoom()
+        self.assertEqual(rz.crop_geometry(320, 180), "240x135+80+45")
+
+    def test_crop_geometry_after_pan(self):
+        rz = vp.RegionZoom()
+        rz.pan(-1, -1)   # 钳到左上角 (0.25, 0.25)
+        self.assertEqual(rz.crop_geometry(320, 180), "160x90+0+0")
+
+
 if __name__ == "__main__":
     unittest.main()

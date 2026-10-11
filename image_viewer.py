@@ -49,7 +49,6 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from viewer_core import (MIN_ZOOM, MAX_ZOOM, MIN_VISIBLE, clamp, natural_key,
                          compute_zoom, rotated_size, clamp_pan, zoom_at_pan,
-                         clamp_rz_center, build_crop_geometry,
                          zoom_slider_value, zoom_slider_pos)
 
 from media_source import (IMAGE_EXTS, ZIP_EXTS, PDF_EXTS, VIDEO_EXTS,
@@ -59,7 +58,7 @@ from media_source import (IMAGE_EXTS, ZIP_EXTS, PDF_EXTS, VIDEO_EXTS,
 from config_store import load_config, save_config
 
 from video_player import (fmt_time, build_vlc_args, build_video_media_options,
-                          video_tmp_name, video_resume_key)
+                          video_tmp_name, video_resume_key, RegionZoom)
 
 # ---- 高 DPI 适配（必须在创建任何窗口之前调用） ----
 # 本机是 150% 缩放的 1920x1080 屏。进程不做 DPI 感知时，Windows 会把界面按
@@ -304,10 +303,7 @@ class ComicViewer(tk.Tk):
             "gamma": clamp(float(adj.get("gamma", 1.0)), 0.01, 10.0),
         }
         # 视频局部放大（区域放大）状态
-        self._region_zoom = False   # 区域放大模式开关（Z 切换）
-        self._rz_cx = 0.5           # 放大框中心 x（归一化 0..1）
-        self._rz_cy = 0.5           # 放大框中心 y（归一化 0..1）
-        self._rz_scale = 0.5        # 放大框边长占视频比例（越小越放大）
+        self.rz = RegionZoom()      # 区域放大纯状态（开关/中心/边长比例）
         self._rz_drag = None        # 拖拽中的起始状态
         self._rz_panel = None       # 区域放大控制面板（Toplevel）
         self._transparent_ticks = 0  # 播放初期重试鼠标穿透的计数
@@ -1137,7 +1133,7 @@ class ComicViewer(tk.Tk):
         self._video_ended = False
         self._ab_start_ms = None
         self._ab_end_ms = None
-        self._region_zoom = False
+        self.rz.enabled = False
         self._hide_rz_panel()
         self._transparent_ticks = 0
         self._resume_seek_ms = self._get_resume_position(src)
@@ -1296,7 +1292,7 @@ class ComicViewer(tk.Tk):
 
     def zoom_in(self):
         if self.is_video:
-            if self._region_zoom:
+            if self.rz.enabled:
                 self._rz_zoom_step(-0.1)
             else:
                 self.change_video_zoom(0.25)
@@ -1305,7 +1301,7 @@ class ComicViewer(tk.Tk):
 
     def zoom_out(self):
         if self.is_video:
-            if self._region_zoom:
+            if self.rz.enabled:
                 self._rz_zoom_step(0.1)
             else:
                 self.change_video_zoom(-0.25)
@@ -1335,7 +1331,7 @@ class ComicViewer(tk.Tk):
             return
         try:
             # 区域放大：裁剪框由 _apply_region_zoom 设置，这里 scale=0 让裁剪区铺满。
-            if self._region_zoom:
+            if self.rz.enabled:
                 self.player.video_set_scale(0)
             # 全屏下默认自动铺满：scale=0 让 libVLC 按屏幕自适应（保持比例、完整显示）。
             # 用户在全屏里手动 +/− 缩放后 _video_fs_fit 变 False，改用显式倍率。
@@ -1346,20 +1342,16 @@ class ComicViewer(tk.Tk):
         except Exception:
             pass
 
-    def _clamp_rz_center(self):
-        self._rz_cx, self._rz_cy = clamp_rz_center(self._rz_cx, self._rz_cy, self._rz_scale)
-
     def _apply_region_zoom(self):
         """区域放大：用裁剪框 crop 出局部区域再铺满；关闭时清除裁剪。"""
         if not self.player or not self.is_video or self._video_is_stopping():
             return
         try:
-            if self._region_zoom:
+            if self.rz.enabled:
                 w, h = self.player.video_get_size()
                 if w <= 0 or h <= 0:
                     return
-                self._clamp_rz_center()
-                crop = build_crop_geometry(w, h, self._rz_cx, self._rz_cy, self._rz_scale)
+                crop = self.rz.crop_geometry(w, h)
                 self.player.video_set_crop_geometry(crop)
             else:
                 self.player.video_set_crop_geometry("")
@@ -1370,10 +1362,9 @@ class ComicViewer(tk.Tk):
     def toggle_region_zoom(self):
         if not self.is_video or self._cast_mode == "dlna":
             return
-        self._region_zoom = not self._region_zoom
-        if self._region_zoom:
-            self._rz_cx = self._rz_cy = 0.5
-            self._rz_scale = 0.5
+        self.rz.enabled = not self.rz.enabled
+        if self.rz.enabled:
+            self.rz.reset()
             self._show_rz_panel()
             self._make_video_window_transparent()   # 确保放大框可被鼠标拖拽（窗口可能已重建）
             self._apply_region_zoom()
@@ -1385,21 +1376,17 @@ class ComicViewer(tk.Tk):
             self._update_status()
 
     def _rz_zoom_step(self, d_scale):
-        self._rz_scale = clamp(round(self._rz_scale + d_scale, 2), 0.1, 1.0)
-        self._clamp_rz_center()
+        self.rz.zoom_step(d_scale)
         self._apply_region_zoom()
         self._update_status()
 
     def _rz_reset_center(self):
-        self._rz_cx = self._rz_cy = 0.5
-        self._clamp_rz_center()
+        self.rz.reset_center()
         self._apply_region_zoom()
         self._update_status()
 
     def _rz_pan(self, dx, dy):
-        self._rz_cx += dx * 0.08
-        self._rz_cy += dy * 0.08
-        self._clamp_rz_center()
+        self.rz.pan(dx * 0.08, dy * 0.08)
         self._apply_region_zoom()
         self._update_status()
 
@@ -1944,7 +1931,7 @@ class ComicViewer(tk.Tk):
         # 而直接返回，避免在后台 stop 进行中误触 player。
         self._save_resume_position()
         self.is_video = False
-        self._region_zoom = False
+        self.rz.enabled = False
         self._hide_rz_panel()
         self._stop_captions()
         self._stop_player()
@@ -3171,7 +3158,7 @@ class ComicViewer(tk.Tk):
         # 视频页：滚轮 => 音量；区域放大模式下 => 缩放放大框大小
         if e.state & 0x0004:
             return
-        if self._region_zoom:
+        if self.rz.enabled:
             self._rz_zoom_step(-0.1 if e.delta > 0 else 0.1)
         else:
             self._apply_video_wheel(e.delta)
@@ -3223,13 +3210,13 @@ class ComicViewer(tk.Tk):
         # 区域放大模式：开始拖拽平移放大框；否则单击 => 播放 / 暂停
         if not self.is_video:
             return
-        if self._region_zoom:
-            self._rz_drag = dict(x=e.x, y=e.y, cx=self._rz_cx, cy=self._rz_cy, moved=False)
+        if self.rz.enabled:
+            self._rz_drag = dict(x=e.x, y=e.y, cx=self.rz.cx, cy=self.rz.cy, moved=False)
         else:
             self._toggle_play()
 
     def _on_video_motion(self, e):
-        if not (self.is_video and self._region_zoom and self._rz_drag):
+        if not (self.is_video and self.rz.enabled and self._rz_drag):
             return
         dx = e.x - self._rz_drag["x"]
         dy = e.y - self._rz_drag["y"]
@@ -3237,9 +3224,9 @@ class ComicViewer(tk.Tk):
             self._rz_drag["moved"] = True
         pw = max(self.video_panel.winfo_width(), 1)
         ph = max(self.video_panel.winfo_height(), 1)
-        self._rz_cx = self._rz_drag["cx"] + dx / pw
-        self._rz_cy = self._rz_drag["cy"] + dy / ph
-        self._clamp_rz_center()
+        self.rz.cx = self._rz_drag["cx"] + dx / pw
+        self.rz.cy = self._rz_drag["cy"] + dy / ph
+        self.rz.clamp_center()
         self._apply_region_zoom()
 
     def _on_video_release(self, e):
@@ -3249,14 +3236,13 @@ class ComicViewer(tk.Tk):
         """区域放大模式下用方向键 / WASD 平移放大框（键盘可靠，不受 VLC 原生窗口影响）。"""
         step = 0.1
         if k in ("Left", "a", "A"):
-            self._rz_cx -= step
+            self.rz.pan(-step, 0)
         elif k in ("Right", "d", "D"):
-            self._rz_cx += step
+            self.rz.pan(step, 0)
         elif k in ("Up", "w", "W"):
-            self._rz_cy -= step
+            self.rz.pan(0, -step)
         elif k in ("Down", "s", "S"):
-            self._rz_cy += step
-        self._clamp_rz_center()
+            self.rz.pan(0, step)
         self._apply_region_zoom()
         self._update_status()
 
@@ -3266,7 +3252,7 @@ class ComicViewer(tk.Tk):
         if isinstance(w, (tk.Entry, tk.Text)) and w.winfo_toplevel() is not self:
             return
         k = e.keysym
-        if self.is_video and self._region_zoom and k in ("Left", "Right", "Up", "Down", "w", "W", "a", "A", "s", "S", "d", "D"):
+        if self.is_video and self.rz.enabled and k in ("Left", "Right", "Up", "Down", "w", "W", "a", "A", "s", "S", "d", "D"):
             self._rz_pan_key(k)
         elif self.is_video and k in ("Left", "Right"):
             self._seek_relative((30 if (e.state & 0x0004) else 5) * (1 if k == "Right" else -1))
