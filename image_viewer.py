@@ -14,6 +14,8 @@
   滚轮 / 触控板上下滑               缩放（以鼠标为中心）
   触控板捏合（Ctrl+滚轮）            缩放
   触控板左右滑                      翻页
+  工具栏缩放滑块                     拖拽调整缩放百分比
+  点击缩放百分比                     重置画面（适应窗口 / 视频 100%）
   + / -                             放大 / 缩小
   拖拽                              平移
   点击画面左 / 右边缘                翻页（方向随阅读方向）
@@ -269,6 +271,8 @@ class ComicViewer(tk.Tk):
         self._haccum_timer = None
         self._hseek_accum = 0
         self._hseek_timer = None
+        self._zoom_slider_guard = False   # 同步滑块位置时抑制回读回调
+        self._zoom_slider_after = None    # 拖拽滑块重绘的节流定时器
         self._ui_hidden = False      # 是否进入沉浸式（全部 UI：工具栏/状态栏/缩略图/视频条都隐藏）
         self._dbl_click = False      # 本次点击是否为双击
         self._dbl_tick = 0           # 双击判定时间戳（毫秒）
@@ -385,8 +389,14 @@ class ComicViewer(tk.Tk):
         self._btn(self.toolbar, "⏭", self.next, tip="下一页")
         self._sep(self.toolbar)
         self.zoom_out_btn = self._btn(self.toolbar, "➖", self.zoom_out, tip="缩小")
-        self.zoom_label = tk.Label(self.toolbar, text="100%", bg=PANEL, fg=MUTED, width=6)
-        self.zoom_label.pack(side="left", padx=4)
+        self.zoom_slider = ttk.Scale(self.toolbar, from_=0, to=1000, orient="horizontal",
+                                     command=self._on_zoom_slider, length=140, takefocus=0)
+        self.zoom_slider.pack(side="left", padx=4)
+        self.zoom_slider.set(self._zoom_slider_pos(1.0))
+        self.zoom_label = tk.Label(self.toolbar, text="100%", bg=PANEL, fg=FG, width=7,
+                                   cursor="hand2", font=("Microsoft YaHei", 10, "bold"))
+        self.zoom_label.pack(side="left", padx=2)
+        self.zoom_label.bind("<Button-1>", self._on_zoom_label_click)
         self.zoom_in_btn = self._btn(self.toolbar, "➕", self.zoom_in, tip="放大")
         self._sep(self.toolbar)
         self._btn(self.toolbar, "⛶ 全屏", self.toggle_fullscreen, tip="全屏 (回车 / F / F11)")
@@ -3048,6 +3058,71 @@ class ComicViewer(tk.Tk):
     def zoom_center(self, f):
         self.zoom_at(self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2, f)
 
+    # ---------------- 缩放滑块（scale 百分比条） ----------------
+    def _zoom_range(self):
+        # 视频缩放范围 0.5x..4x，图片 2%..4000%
+        return (0.5, 4.0) if self.is_video else (MIN_ZOOM, MAX_ZOOM)
+
+    def _zoom_slider_value(self, pos):
+        """滑块 0..1000 -> 真实缩放倍率（对数刻度，拖动手感均匀）。"""
+        lo, hi = self._zoom_range()
+        return lo * (hi / lo) ** (float(pos) / 1000.0)
+
+    def _zoom_slider_pos(self, z):
+        """真实缩放倍率 -> 滑块 0..1000（对数刻度）。"""
+        lo, hi = self._zoom_range()
+        z = clamp(z, lo, hi)
+        return int(round(1000.0 * math.log(z / lo) / math.log(hi / lo)))
+
+    def _sync_zoom_slider(self):
+        if not hasattr(self, "zoom_slider"):
+            return
+        z = self._video_zoom if self.is_video else self.zoom
+        self._zoom_slider_guard = True
+        try:
+            self.zoom_slider.set(self._zoom_slider_pos(z))
+        finally:
+            self._zoom_slider_guard = False
+
+    def _on_zoom_slider(self, val):
+        if getattr(self, "_zoom_slider_guard", False):
+            return
+        if not (self.orig or self.is_video):
+            return
+        z = self._zoom_slider_value(val)
+        if self.is_video:
+            self._video_zoom = clamp(round(z, 2), 0.5, 4.0)
+            if self.attributes("-fullscreen"):
+                self._video_fs_fit = False   # 手动缩放后不再自动铺满
+            self._apply_video_zoom()
+            self._save_video_options()
+            self._update_status()
+            return
+        # 图片页：即时更新百分比，重绘做轻量节流避免大图卡顿
+        old = max(self.zoom, 1e-6)
+        self.zoom = clamp(z, MIN_ZOOM, MAX_ZOOM)
+        f = self.zoom / old
+        self.pan_x *= f
+        self.pan_y *= f
+        self.fit_mode = "custom"
+        self._clamp_pan()
+        self.zoom_label.configure(text="%d%%" % int(round(self.zoom * 100)))
+        if self._zoom_slider_after:
+            self.after_cancel(self._zoom_slider_after)
+        self._zoom_slider_after = self.after(25, self._zoom_slider_render)
+
+    def _zoom_slider_render(self):
+        self._zoom_slider_after = None
+        if not self.is_video and self.orig:
+            self._render()
+
+    def _on_zoom_label_click(self, _e):
+        # 点击百分比 => 重置画面（图片：适应窗口；视频：恢复 100%）
+        if self.is_video:
+            self.reset_video_zoom()
+        elif self.orig:
+            self.set_fit("window")
+
     def toggle_fullscreen(self):
         entering_fullscreen = not self.attributes("-fullscreen")
         self.attributes("-fullscreen", entering_fullscreen)
@@ -3548,6 +3623,7 @@ class ComicViewer(tk.Tk):
     def _update_status(self):
         if not self.sources:
             return
+        self._sync_zoom_slider()
         if self.is_video:
             name = self._display_name(self.sources[self.index])
             self.page_label.configure(text="%d / %d" % (self.index + 1, len(self.sources)))
@@ -3600,6 +3676,8 @@ class ComicViewer(tk.Tk):
             "滚轮 / 触控板上下滑             缩放（以鼠标为中心）\n"
             "触控板捏合（Ctrl+滚轮）          缩放\n"
             "触控板左右滑                   翻页（方向随阅读方向）\n"
+            "工具栏缩放滑块                   拖拽调整缩放百分比\n"
+            "点击缩放百分比                   重置（图片：适应窗口 / 视频：100%）\n"
             "+ / -                          放大 / 缩小\n"
             "拖拽                           平移图片\n"
             "快速左右滑动                   翻页（方向随阅读方向）\n"
