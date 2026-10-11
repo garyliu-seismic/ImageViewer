@@ -1466,8 +1466,10 @@ class ComicViewer(tk.Tk):
                 self._clamp_rz_center()
                 x = int(round(self._rz_cx * w - box_w / 2.0))
                 y = int(round(self._rz_cy * h - box_h / 2.0))
-                # 裁剪格式（VLC 实测）："WxH+X+Y" = 裁剪区宽度 x 高度 + 左上角 x 偏移 + 左上角 y 偏移
-                self.player.video_set_crop_geometry("%dx%d+%d+%d" % (box_w, box_h, x, y))
+                # 裁剪格式（VLC 实测）："WxH+X+Y" 中 W/H 是右下角坐标，X/Y 是左上角坐标，
+                # 即裁剪矩形 = [X, W] × [Y, H]。所以右下角要传 x+box_w / y+box_h。
+                # （注意：不能用“宽x高+左+上”，否则右/下边被固定，移动时画面会变窄成条状）
+                self.player.video_set_crop_geometry("%dx%d+%d+%d" % (x + box_w, y + box_h, x, y))
             else:
                 self.player.video_set_crop_geometry("")
             self._apply_video_zoom()
