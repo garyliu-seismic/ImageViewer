@@ -36,7 +36,6 @@
 import os
 import io
 import sys
-import re
 import math
 import time
 import json
@@ -49,6 +48,11 @@ import shutil
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
+
+from viewer_core import (MIN_ZOOM, MAX_ZOOM, MIN_VISIBLE, clamp, natural_key,
+                         compute_zoom, rotated_size, clamp_pan, zoom_at_pan,
+                         clamp_rz_center, build_crop_geometry,
+                         zoom_slider_value, zoom_slider_pos)
 
 # ---- 高 DPI 适配（必须在创建任何窗口之前调用） ----
 # 本机是 150% 缩放的 1920x1080 屏。进程不做 DPI 感知时，Windows 会把界面按
@@ -120,19 +124,6 @@ BTN_ACTIVE = "#313741"
 FG = "#e7e9ee"
 MUTED = "#9aa2b1"
 ACCENT = "#4c8dff"
-
-MIN_ZOOM, MAX_ZOOM = 0.02, 40.0
-MIN_VISIBLE = 60  # 平移时至少保留的可见像素
-
-
-def natural_key(s):
-    """自然排序：让 page2 排在 page10 之前。"""
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
-
-
-def clamp(v, a, b):
-    return min(max(v, a), b)
-
 
 def _register_shift(ref_gray, frm_gray):
     """用相位相关估算 frm 相对 ref 的亚像素平移 (dx, dy)（单位：像素）。
@@ -1447,10 +1438,7 @@ class ComicViewer(tk.Tk):
             pass
 
     def _clamp_rz_center(self):
-        lo = self._rz_scale / 2.0
-        hi = 1.0 - lo
-        self._rz_cx = clamp(self._rz_cx, lo, hi)
-        self._rz_cy = clamp(self._rz_cy, lo, hi)
+        self._rz_cx, self._rz_cy = clamp_rz_center(self._rz_cx, self._rz_cy, self._rz_scale)
 
     def _apply_region_zoom(self):
         """区域放大：用裁剪框 crop 出局部区域再铺满；关闭时清除裁剪。"""
@@ -1461,15 +1449,9 @@ class ComicViewer(tk.Tk):
                 w, h = self.player.video_get_size()
                 if w <= 0 or h <= 0:
                     return
-                box_w = max(1, int(round(w * self._rz_scale)))
-                box_h = max(1, int(round(h * self._rz_scale)))
                 self._clamp_rz_center()
-                x = int(round(self._rz_cx * w - box_w / 2.0))
-                y = int(round(self._rz_cy * h - box_h / 2.0))
-                # 裁剪格式（VLC 实测）："WxH+X+Y" 中 W/H 是右下角坐标，X/Y 是左上角坐标，
-                # 即裁剪矩形 = [X, W] × [Y, H]。所以右下角要传 x+box_w / y+box_h。
-                # （注意：不能用“宽x高+左+上”，否则右/下边被固定，移动时画面会变窄成条状）
-                self.player.video_set_crop_geometry("%dx%d+%d+%d" % (x + box_w, y + box_h, x, y))
+                crop = build_crop_geometry(w, h, self._rz_cx, self._rz_cy, self._rz_scale)
+                self.player.video_set_crop_geometry(crop)
             else:
                 self.player.video_set_crop_geometry("")
             self._apply_video_zoom()
@@ -2704,10 +2686,7 @@ class ComicViewer(tk.Tk):
         src = self._spread_img if self._spread_img is not None else self.orig
         if not src:
             return 1, 1
-        w, h = src.size
-        if self.rotation % 180 == 90:
-            w, h = h, w
-        return w, h
+        return rotated_size(src.size[0], src.size[1], self.rotation)
 
     def _compute_zoom(self):
         if not self.orig:
@@ -2715,17 +2694,7 @@ class ComicViewer(tk.Tk):
         cw = max(self.canvas.winfo_width(), 1)
         ch = max(self.canvas.winfo_height(), 1)
         rw, rh = self._rotated_size()
-        if self.fit_mode == "width":
-            z = cw / rw
-        elif self.fit_mode == "height":
-            z = ch / rh
-        elif self.fit_mode == "window":
-            z = min(cw / rw, ch / rh)
-        elif self.fit_mode == "actual":
-            z = 1.0
-        else:
-            z = self.zoom
-        return clamp(z, MIN_ZOOM, MAX_ZOOM)
+        return compute_zoom(self.fit_mode, self.zoom, cw, ch, rw, rh)
 
     def _render(self):
         if not self.orig:
@@ -2770,11 +2739,7 @@ class ComicViewer(tk.Tk):
         cw = max(self.canvas.winfo_width(), 1)
         ch = max(self.canvas.winfo_height(), 1)
         rw, rh = self._rotated_size()
-        rw, rh = rw * self.zoom, rh * self.zoom
-        maxx = 0 if rw <= cw else (rw - cw) / 2 + MIN_VISIBLE
-        maxy = 0 if rh <= ch else (rh - ch) / 2 + MIN_VISIBLE
-        self.pan_x = clamp(self.pan_x, -maxx, maxx)
-        self.pan_y = clamp(self.pan_y, -maxy, maxy)
+        self.pan_x, self.pan_y = clamp_pan(self.pan_x, self.pan_y, cw, ch, rw, rh, self.zoom)
 
     # ---------------- 操作 ----------------
     def next(self):
@@ -3050,8 +3015,7 @@ class ComicViewer(tk.Tk):
         f = new_zoom / self.zoom
         cw = max(self.canvas.winfo_width(), 1)
         ch = max(self.canvas.winfo_height(), 1)
-        self.pan_x = self.pan_x * f + (x - cw / 2) * (1 - f)
-        self.pan_y = self.pan_y * f + (y - ch / 2) * (1 - f)
+        self.pan_x, self.pan_y = zoom_at_pan(self.pan_x, self.pan_y, x, y, cw, ch, f)
         self.zoom = new_zoom
         self.fit_mode = "custom"
         self._clamp_pan()
@@ -3068,13 +3032,12 @@ class ComicViewer(tk.Tk):
     def _zoom_slider_value(self, pos):
         """滑块 0..1000 -> 真实缩放倍率（对数刻度，拖动手感均匀）。"""
         lo, hi = self._zoom_range()
-        return lo * (hi / lo) ** (float(pos) / 1000.0)
+        return zoom_slider_value(pos, lo, hi)
 
     def _zoom_slider_pos(self, z):
         """真实缩放倍率 -> 滑块 0..1000（对数刻度）。"""
         lo, hi = self._zoom_range()
-        z = clamp(z, lo, hi)
-        return int(round(1000.0 * math.log(z / lo) / math.log(hi / lo)))
+        return zoom_slider_pos(z, lo, hi)
 
     def _sync_zoom_slider(self):
         if not hasattr(self, "zoom_slider"):
