@@ -1527,25 +1527,25 @@ class ComicViewer(tk.Tk):
         win.resizable(False, False)
         self._rz_panel = win
 
-        def mk(txt, cmd, w=2):
-            return tk.Button(win, text=txt, command=cmd, width=w, takefocus=0,
+        def mk(parent, txt, cmd, w=2):
+            return tk.Button(parent, text=txt, command=cmd, width=w, takefocus=0,
                              bg=BTN_BG, fg=FG, activebackground=BTN_ACTIVE, activeforeground="#fff",
                              relief="flat", bd=0, pady=6, font=("Microsoft YaHei", 11),
                              cursor="hand2")
 
         grid = tk.Frame(win, bg="#1a1d24")
         grid.pack(padx=8, pady=8)
-        mk("↑", lambda: self._rz_pan(0, -1)).grid(row=0, column=1, padx=2, pady=2)
-        mk("←", lambda: self._rz_pan(-1, 0)).grid(row=1, column=0, padx=2, pady=2)
-        mk("·", None, w=2).grid(row=1, column=1, padx=2, pady=2)
-        mk("→", lambda: self._rz_pan(1, 0)).grid(row=1, column=2, padx=2, pady=2)
-        mk("↓", lambda: self._rz_pan(0, 1)).grid(row=2, column=1, padx=2, pady=2)
-        mk("＋", lambda: self._rz_zoom_step(-0.1), w=2).grid(row=0, column=3, padx=2, pady=2)
-        mk("－", lambda: self._rz_zoom_step(0.1), w=2).grid(row=1, column=3, padx=2, pady=2)
+        mk(grid, "↑", lambda: self._rz_pan(0, -1)).grid(row=0, column=1, padx=2, pady=2)
+        mk(grid, "←", lambda: self._rz_pan(-1, 0)).grid(row=1, column=0, padx=2, pady=2)
+        mk(grid, "·", None, w=2).grid(row=1, column=1, padx=2, pady=2)
+        mk(grid, "→", lambda: self._rz_pan(1, 0)).grid(row=1, column=2, padx=2, pady=2)
+        mk(grid, "↓", lambda: self._rz_pan(0, 1)).grid(row=2, column=1, padx=2, pady=2)
+        mk(grid, "＋", lambda: self._rz_zoom_step(-0.1), w=2).grid(row=0, column=3, padx=2, pady=2)
+        mk(grid, "－", lambda: self._rz_zoom_step(0.1), w=2).grid(row=1, column=3, padx=2, pady=2)
         row2 = tk.Frame(win, bg="#1a1d24")
         row2.pack(pady=(0, 8))
-        mk("居中", lambda: self._rz_reset_center(), w=4).pack(side="left", padx=4)
-        mk("退出", lambda: self.toggle_region_zoom(), w=4).pack(side="left", padx=4)
+        mk(row2, "居中", lambda: self._rz_reset_center(), w=4).pack(side="left", padx=4)
+        mk(row2, "退出", lambda: self.toggle_region_zoom(), w=4).pack(side="left", padx=4)
 
         win.update_idletasks()
         try:
