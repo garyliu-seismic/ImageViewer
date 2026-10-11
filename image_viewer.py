@@ -40,7 +40,6 @@ import math
 import time
 import random
 import queue
-import hashlib
 import zipfile
 import tempfile
 import shutil
@@ -58,6 +57,9 @@ from media_source import (IMAGE_EXTS, ZIP_EXTS, PDF_EXTS, VIDEO_EXTS,
                           parse_playlist, files_book_key, playlist_book_key,
                           update_history)
 from config_store import load_config, save_config
+
+from video_player import (fmt_time, build_vlc_args, build_video_media_options,
+                          video_tmp_name, video_resume_key)
 
 # ---- 高 DPI 适配（必须在创建任何窗口之前调用） ----
 # 本机是 150% 缩放的 1920x1080 屏。进程不做 DPI 感知时，Windows 会把界面按
@@ -1095,18 +1097,7 @@ class ComicViewer(tk.Tk):
             # 打开另一个视频，卡死在 libvlc_media_player_stop）。GDI 纯 CPU 渲染
             # 不经过 GPU 驱动，绕开这个死锁；代价是高清视频软渲染更吃 CPU，但
             # 漫画里的短视频通常够用。
-            args = [
-                "--avcodec-hw=none", "--vout=wingdi",
-                # 不接管鼠标/键盘事件：让滚轮 / 触控板手势 / 快捷键传到 Tk
-                # （否则 VLC 会把 F=全屏、空格=暂停、回车=导航、滚轮=音量 都自己吃掉）
-                "--no-mouse-events", "--no-keyboard-events",
-            ]
-            # 视频旋转：transform 滤镜必须是 Instance 级选项（media 级 :video-filter
-            # 在本机 VLC 3.0.20 + set_hwnd 下不会被 vout 继承，实测无效）。
-            # 角度改变时重建实例。
-            if self._video_rotation:
-                args.append("--video-filter=transform")
-                args.append("--transform-type=%d" % self._video_rotation)
+            args = build_vlc_args(self._video_rotation)
             self.vlc_instance = vlc.Instance(args)
             self.player = self.vlc_instance.media_player_new()
             return True
@@ -1117,9 +1108,7 @@ class ComicViewer(tk.Tk):
         if isinstance(src, tuple):
             if src in self._video_cache:
                 return self._video_cache[src]
-            name = src[1].replace("\\", "/").split("/")[-1]
-            ext = os.path.splitext(name)[1].lower()
-            tmp = os.path.join(self._tmp_dir, "v_" + hashlib.md5(src[1].encode("utf-8")).hexdigest()[:12] + ext)
+            tmp = video_tmp_name(src[1], self._tmp_dir)
             try:
                 z = self._zip or zipfile.ZipFile(src[0])
                 with open(tmp, "wb") as f:
@@ -1160,11 +1149,7 @@ class ComicViewer(tk.Tk):
             # 关掉 D3D11VA 硬件解码：必须作为 media 选项传才生效（Instance 上的
             # --avcodec-hw=none 在 VLC 3.0.20 里不生效；而且 set_hwnd() 会把
             # avcodec-hw 重置为空）。否则切视频时解码器收尾会死锁。
-            opts = [":avcodec-hw=none", ":rate=%.3f" % self._rate, ":audio-time-stretch"]
-            if self._sub_path:
-                # 外挂字幕文件（.srt/.ass/.sub/.ssa）：交给 VLC 内置字幕解码器
-                # 渲染到画面。set_media 后补一次 sub-file，避免 set_hwnd 把它重置。
-                opts.append(":sub-file=" + self._sub_path.replace("\\", "/"))
+            opts = build_video_media_options(self._rate, self._sub_path)
             media = self.vlc_instance.media_new(path, *opts)
             self.player.set_media(media)
             self.player.set_hwnd(self.video_panel.winfo_id())
@@ -1271,9 +1256,7 @@ class ComicViewer(tk.Tk):
             pass
 
     def _video_resume_key(self, src):
-        if isinstance(src, tuple):
-            return None
-        return os.path.normcase(os.path.abspath(src))
+        return video_resume_key(src)
 
     def _get_resume_position(self, src):
         key = self._video_resume_key(src)
@@ -2560,10 +2543,7 @@ class ComicViewer(tk.Tk):
 
     @staticmethod
     def _fmt_time(ms):
-        if ms < 0:
-            ms = 0
-        s = ms // 1000
-        return "%d:%02d" % (s // 60, s % 60)
+        return fmt_time(ms)
 
     # ---------------- 显示 ----------------
     def show_file(self, i):
