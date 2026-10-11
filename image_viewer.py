@@ -38,7 +38,6 @@ import io
 import sys
 import math
 import time
-import json
 import random
 import queue
 import hashlib
@@ -53,6 +52,12 @@ from viewer_core import (MIN_ZOOM, MAX_ZOOM, MIN_VISIBLE, clamp, natural_key,
                          compute_zoom, rotated_size, clamp_pan, zoom_at_pan,
                          clamp_rz_center, build_crop_geometry,
                          zoom_slider_value, zoom_slider_pos)
+
+from media_source import (IMAGE_EXTS, ZIP_EXTS, PDF_EXTS, VIDEO_EXTS,
+                          media_files_in, build_zip_chapters, expand_paths,
+                          parse_playlist, files_book_key, playlist_book_key,
+                          update_history)
+from config_store import load_config, save_config
 
 # ---- 高 DPI 适配（必须在创建任何窗口之前调用） ----
 # 本机是 150% 缩放的 1920x1080 屏。进程不做 DPI 感知时，Windows 会把界面按
@@ -83,11 +88,6 @@ try:
     import pymupdf as fitz  # PyMuPDF，用于读取 PDF 漫画
 except ImportError:
     fitz = None
-
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".avif", ".jfif"}
-ZIP_EXTS = {".zip", ".cbz"}
-PDF_EXTS = {".pdf"}
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".wmv", ".flv", ".m4v", ".ts", ".mpg", ".mpeg", ".3gp"}
 
 CAPTION_LANGS = ["中文", "英文", "日语", "韩语", "粤语"]
 CAPTION_LANG_CODES = {"中文": "zh", "英文": "en", "日语": "ja", "韩语": "ko", "粤语": "yue"}
@@ -630,18 +630,10 @@ class ComicViewer(tk.Tk):
 
     # ---------------- 配置 / 断点续读 ----------------
     def _load_config(self):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        return load_config(CONFIG_PATH)
 
     def _save_config(self):
-        try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self._config, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        save_config(CONFIG_PATH, self._config)
 
     def _save_progress(self):
         if not self.book_key or not self.sources:
@@ -706,7 +698,7 @@ class ComicViewer(tk.Tk):
             self._reset_chapters()
             self._playlist = []
             self._playlist_index0 = None
-            self.book_key = "files:" + hashlib.sha1("|".join(imgs).encode("utf-8")).hexdigest()[:16]
+            self.book_key = files_book_key(imgs)
             self._load_list(imgs)
 
     def open_zip(self):
@@ -750,26 +742,13 @@ class ComicViewer(tk.Tk):
             messagebox.showerror("错误", "无法读取播放列表：%s" % error)
             return
 
-        base_dir = os.path.dirname(path)
-        sources = []
-        for line in lines:
-            entry = line.strip()
-            if not entry or entry.startswith("#"):
-                continue
-            source = entry if os.path.isabs(entry) else os.path.normpath(os.path.join(base_dir, entry))
-            if os.path.isfile(source):
-                if os.path.splitext(source)[1].lower() in PDF_EXTS:
-                    n = self._pdf_page_count(source)
-                    if n > 0:
-                        sources.extend((source, i) for i in range(n))
-                else:
-                    sources.append(source)
+        sources = parse_playlist(lines, os.path.dirname(path), self._pdf_page_count)
         if not sources:
             messagebox.showinfo("提示", "播放列表中没有可访问的媒体文件。")
             return
 
         self._close_zip()
-        self.book_key = "playlist:" + os.path.abspath(path)
+        self.book_key = playlist_book_key(path)
         self._playlist = list(sources)
         self._playlist_index0 = 0
         self._reset_chapters()
@@ -784,53 +763,15 @@ class ComicViewer(tk.Tk):
                 return
         if not os.path.isfile(src):
             return
-        path = os.path.abspath(src)
-        try:
-            history = []
-            if os.path.isfile(HISTORY_PLAYLIST_PATH):
-                with open(HISTORY_PLAYLIST_PATH, "r", encoding="utf-8-sig") as history_file:
-                    history = [line.strip() for line in history_file
-                               if line.strip() and not line.startswith("#")]
-            key = os.path.normcase(os.path.normpath(path))
-            if history and os.path.normcase(os.path.normpath(history[0])) == key:
-                return   # 已在顶部，避免重复写盘
-            history = [entry for entry in history
-                       if os.path.normcase(os.path.normpath(entry)) != key]
-            history.insert(0, path)
-            with open(HISTORY_PLAYLIST_PATH, "w", encoding="utf-8") as history_file:
-                history_file.write("#EXTM3U\n")
-                history_file.write("\n".join(history[:HISTORY_LIMIT]))
-                history_file.write("\n")
-        except OSError:
-            pass
+        update_history(src, HISTORY_PLAYLIST_PATH, HISTORY_LIMIT)
 
     def _load_zip_path(self, p):
         try:
             with zipfile.ZipFile(p) as z:
-                names = [n for n in z.namelist()
-                         if not n.endswith("/") and os.path.splitext(n)[1].lower() in (IMAGE_EXTS | VIDEO_EXTS)]
-            if not names:
+                chapters = build_zip_chapters(p, z.namelist())
+            if not chapters:
                 messagebox.showinfo("提示", "压缩包内没有图片或视频文件。")
                 return
-
-            # 按顶层目录分组（作为章节）；无子目录的条目归入「根目录」
-            groups = {}
-            flat = []
-            for n in names:
-                parts = n.replace("\\", "/").split("/")
-                if len(parts) > 1 and parts[0]:
-                    groups.setdefault(parts[0], []).append(n)
-                else:
-                    flat.append(n)
-
-            def sort_names(lst):
-                return sorted(lst, key=lambda n: natural_key(n.replace("\\", "/").split("/")[-1]))
-
-            chapters = []
-            if flat:
-                chapters.append({"title": "根目录", "sources": [(p, n) for n in sort_names(flat)]})
-            for top in sorted(groups, key=natural_key):
-                chapters.append({"title": top, "sources": [(p, n) for n in sort_names(groups[top])]})
 
             self._close_zip()
             self._zip = zipfile.ZipFile(p)
@@ -957,26 +898,11 @@ class ComicViewer(tk.Tk):
 
     def _media_files_in(self, directory):
         """递归收集目录下的图片/视频/PDF，按相对路径自然排序。"""
-        out = []
-        for root, dirs, files in os.walk(directory):
-            dirs.sort(key=natural_key)
-            for f in sorted(files, key=natural_key):
-                if os.path.splitext(f)[1].lower() in (IMAGE_EXTS | VIDEO_EXTS | PDF_EXTS):
-                    out.append(os.path.join(root, f))
-        out.sort(key=lambda p: natural_key(os.path.relpath(p, directory)))
-        return out
+        return media_files_in(directory)
 
     def _expand_sources(self, paths):
         """把文件路径列表转成页面来源列表（PDF 展开为每页）。"""
-        sources = []
-        for p in paths:
-            if os.path.splitext(p)[1].lower() in PDF_EXTS:
-                n = self._pdf_page_count(p)
-                if n > 0:
-                    sources.extend((p, i) for i in range(n))
-            else:
-                sources.append(p)
-        return sources
+        return expand_paths(paths, self._pdf_page_count)
 
     def _load_chapters(self, chapters, book_key):
         if not chapters:
