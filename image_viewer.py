@@ -1466,9 +1466,8 @@ class ComicViewer(tk.Tk):
                 self._clamp_rz_center()
                 x = int(round(self._rz_cx * w - box_w / 2.0))
                 y = int(round(self._rz_cy * h - box_h / 2.0))
-                # 裁剪格式（实测）："WxH+X+Y" 中 W/H 是右下角坐标，X/Y 是左上角坐标，
-                # 即裁剪矩形 = [X, W] x [Y, H]。所以右下角要传 x+box_w / y+box_h。
-                self.player.video_set_crop_geometry("%dx%d+%d+%d" % (x + box_w, y + box_h, x, y))
+                # 裁剪格式（VLC 实测）："WxH+X+Y" = 裁剪区宽度 x 高度 + 左上角 x 偏移 + 左上角 y 偏移
+                self.player.video_set_crop_geometry("%dx%d+%d+%d" % (box_w, box_h, x, y))
             else:
                 self.player.video_set_crop_geometry("")
             self._apply_video_zoom()
@@ -1483,6 +1482,7 @@ class ComicViewer(tk.Tk):
             self._rz_cx = self._rz_cy = 0.5
             self._rz_scale = 0.5
             self._show_rz_panel()
+            self._make_video_window_transparent()   # 确保放大框可被鼠标拖拽（窗口可能已重建）
             self._apply_region_zoom()
             self._update_status()
             self.status.configure(text="区域放大：方向键 / WASD 平移 · 滚轮 / +- 缩放 · 面板按钮也可用 · Z 退出")
@@ -2370,11 +2370,11 @@ class ComicViewer(tk.Tk):
             pass
         self._video_timer = self.after(500, self._update_video_time_loop)
 
-        # 播放初期持续把 VLC 原生窗口设为鼠标穿透（窗口可能延迟创建，每 ~1s 重试）
-        if self._transparent_ticks < 16:
-            self._transparent_ticks += 1
-            if self._transparent_ticks % 2 == 0:
-                self._make_video_window_transparent()
+        # 持续把 VLC 原生窗口设为鼠标穿透（窗口可能延迟创建，也可能在播放中重建，
+        # 每 ~1s 重试；已钩过的窗口会跳过，代价很低）。
+        self._transparent_ticks += 1
+        if self._transparent_ticks % 2 == 0:
+            self._make_video_window_transparent()
 
         # 刷新视频条上的字幕/速率按钮状态（~2Hz，轻量，避免手动在各处重绘）
         try:
