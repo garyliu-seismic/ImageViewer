@@ -14,6 +14,8 @@
   滚轮 / 触控板上下滑               缩放（以鼠标为中心）
   触控板捏合（Ctrl+滚轮）            缩放
   触控板左右滑                      翻页
+  工具栏缩放滑块                     拖拽调整缩放百分比
+  点击缩放百分比                     重置画面（适应窗口 / 视频 100%）
   + / -                             放大 / 缩小
   拖拽                              平移
   点击画面左 / 右边缘                翻页（方向随阅读方向）
@@ -34,19 +36,29 @@
 import os
 import io
 import sys
-import re
 import math
 import time
-import json
 import random
 import queue
-import hashlib
 import zipfile
 import tempfile
 import shutil
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
+
+from viewer_core import (MIN_ZOOM, MAX_ZOOM, MIN_VISIBLE, clamp, natural_key,
+                         compute_zoom, rotated_size, clamp_pan, zoom_at_pan,
+                         zoom_slider_value, zoom_slider_pos)
+
+from media_source import (IMAGE_EXTS, ZIP_EXTS, PDF_EXTS, VIDEO_EXTS,
+                          media_files_in, build_zip_chapters, expand_paths,
+                          parse_playlist, files_book_key, playlist_book_key,
+                          update_history)
+from config_store import load_config, save_config
+
+from video_player import (fmt_time, build_vlc_args, build_video_media_options,
+                          video_tmp_name, video_resume_key, RegionZoom)
 
 # ---- 高 DPI 适配（必须在创建任何窗口之前调用） ----
 # 本机是 150% 缩放的 1920x1080 屏。进程不做 DPI 感知时，Windows 会把界面按
@@ -77,11 +89,6 @@ try:
     import pymupdf as fitz  # PyMuPDF，用于读取 PDF 漫画
 except ImportError:
     fitz = None
-
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".avif", ".jfif"}
-ZIP_EXTS = {".zip", ".cbz"}
-PDF_EXTS = {".pdf"}
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".wmv", ".flv", ".m4v", ".ts", ".mpg", ".mpeg", ".3gp"}
 
 CAPTION_LANGS = ["中文", "英文", "日语", "韩语", "粤语"]
 CAPTION_LANG_CODES = {"中文": "zh", "英文": "en", "日语": "ja", "韩语": "ko", "粤语": "yue"}
@@ -118,19 +125,6 @@ BTN_ACTIVE = "#313741"
 FG = "#e7e9ee"
 MUTED = "#9aa2b1"
 ACCENT = "#4c8dff"
-
-MIN_ZOOM, MAX_ZOOM = 0.02, 40.0
-MIN_VISIBLE = 60  # 平移时至少保留的可见像素
-
-
-def natural_key(s):
-    """自然排序：让 page2 排在 page10 之前。"""
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
-
-
-def clamp(v, a, b):
-    return min(max(v, a), b)
-
 
 def _register_shift(ref_gray, frm_gray):
     """用相位相关估算 frm 相对 ref 的亚像素平移 (dx, dy)（单位：像素）。
@@ -269,6 +263,8 @@ class ComicViewer(tk.Tk):
         self._haccum_timer = None
         self._hseek_accum = 0
         self._hseek_timer = None
+        self._zoom_slider_guard = False   # 同步滑块位置时抑制回读回调
+        self._zoom_slider_after = None    # 拖拽滑块重绘的节流定时器
         self._ui_hidden = False      # 是否进入沉浸式（全部 UI：工具栏/状态栏/缩略图/视频条都隐藏）
         self._dbl_click = False      # 本次点击是否为双击
         self._dbl_tick = 0           # 双击判定时间戳（毫秒）
@@ -307,10 +303,7 @@ class ComicViewer(tk.Tk):
             "gamma": clamp(float(adj.get("gamma", 1.0)), 0.01, 10.0),
         }
         # 视频局部放大（区域放大）状态
-        self._region_zoom = False   # 区域放大模式开关（Z 切换）
-        self._rz_cx = 0.5           # 放大框中心 x（归一化 0..1）
-        self._rz_cy = 0.5           # 放大框中心 y（归一化 0..1）
-        self._rz_scale = 0.5        # 放大框边长占视频比例（越小越放大）
+        self.rz = RegionZoom()      # 区域放大纯状态（开关/中心/边长比例）
         self._rz_drag = None        # 拖拽中的起始状态
         self._rz_panel = None       # 区域放大控制面板（Toplevel）
         self._transparent_ticks = 0  # 播放初期重试鼠标穿透的计数
@@ -385,8 +378,14 @@ class ComicViewer(tk.Tk):
         self._btn(self.toolbar, "⏭", self.next, tip="下一页")
         self._sep(self.toolbar)
         self.zoom_out_btn = self._btn(self.toolbar, "➖", self.zoom_out, tip="缩小")
-        self.zoom_label = tk.Label(self.toolbar, text="100%", bg=PANEL, fg=MUTED, width=6)
-        self.zoom_label.pack(side="left", padx=4)
+        self.zoom_slider = ttk.Scale(self.toolbar, from_=0, to=1000, orient="horizontal",
+                                     command=self._on_zoom_slider, length=140, takefocus=0)
+        self.zoom_slider.pack(side="left", padx=4)
+        self.zoom_slider.set(self._zoom_slider_pos(1.0))
+        self.zoom_label = tk.Label(self.toolbar, text="100%", bg=PANEL, fg=FG, width=7,
+                                   cursor="hand2", font=("Microsoft YaHei", 10, "bold"))
+        self.zoom_label.pack(side="left", padx=2)
+        self.zoom_label.bind("<Button-1>", self._on_zoom_label_click)
         self.zoom_in_btn = self._btn(self.toolbar, "➕", self.zoom_in, tip="放大")
         self._sep(self.toolbar)
         self._btn(self.toolbar, "⛶ 全屏", self.toggle_fullscreen, tip="全屏 (回车 / F / F11)")
@@ -636,18 +635,10 @@ class ComicViewer(tk.Tk):
 
     # ---------------- 配置 / 断点续读 ----------------
     def _load_config(self):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        return load_config(CONFIG_PATH)
 
     def _save_config(self):
-        try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self._config, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        save_config(CONFIG_PATH, self._config)
 
     def _save_progress(self):
         if not self.book_key or not self.sources:
@@ -712,7 +703,7 @@ class ComicViewer(tk.Tk):
             self._reset_chapters()
             self._playlist = []
             self._playlist_index0 = None
-            self.book_key = "files:" + hashlib.sha1("|".join(imgs).encode("utf-8")).hexdigest()[:16]
+            self.book_key = files_book_key(imgs)
             self._load_list(imgs)
 
     def open_zip(self):
@@ -756,26 +747,13 @@ class ComicViewer(tk.Tk):
             messagebox.showerror("错误", "无法读取播放列表：%s" % error)
             return
 
-        base_dir = os.path.dirname(path)
-        sources = []
-        for line in lines:
-            entry = line.strip()
-            if not entry or entry.startswith("#"):
-                continue
-            source = entry if os.path.isabs(entry) else os.path.normpath(os.path.join(base_dir, entry))
-            if os.path.isfile(source):
-                if os.path.splitext(source)[1].lower() in PDF_EXTS:
-                    n = self._pdf_page_count(source)
-                    if n > 0:
-                        sources.extend((source, i) for i in range(n))
-                else:
-                    sources.append(source)
+        sources = parse_playlist(lines, os.path.dirname(path), self._pdf_page_count)
         if not sources:
             messagebox.showinfo("提示", "播放列表中没有可访问的媒体文件。")
             return
 
         self._close_zip()
-        self.book_key = "playlist:" + os.path.abspath(path)
+        self.book_key = playlist_book_key(path)
         self._playlist = list(sources)
         self._playlist_index0 = 0
         self._reset_chapters()
@@ -790,53 +768,15 @@ class ComicViewer(tk.Tk):
                 return
         if not os.path.isfile(src):
             return
-        path = os.path.abspath(src)
-        try:
-            history = []
-            if os.path.isfile(HISTORY_PLAYLIST_PATH):
-                with open(HISTORY_PLAYLIST_PATH, "r", encoding="utf-8-sig") as history_file:
-                    history = [line.strip() for line in history_file
-                               if line.strip() and not line.startswith("#")]
-            key = os.path.normcase(os.path.normpath(path))
-            if history and os.path.normcase(os.path.normpath(history[0])) == key:
-                return   # 已在顶部，避免重复写盘
-            history = [entry for entry in history
-                       if os.path.normcase(os.path.normpath(entry)) != key]
-            history.insert(0, path)
-            with open(HISTORY_PLAYLIST_PATH, "w", encoding="utf-8") as history_file:
-                history_file.write("#EXTM3U\n")
-                history_file.write("\n".join(history[:HISTORY_LIMIT]))
-                history_file.write("\n")
-        except OSError:
-            pass
+        update_history(src, HISTORY_PLAYLIST_PATH, HISTORY_LIMIT)
 
     def _load_zip_path(self, p):
         try:
             with zipfile.ZipFile(p) as z:
-                names = [n for n in z.namelist()
-                         if not n.endswith("/") and os.path.splitext(n)[1].lower() in (IMAGE_EXTS | VIDEO_EXTS)]
-            if not names:
+                chapters = build_zip_chapters(p, z.namelist())
+            if not chapters:
                 messagebox.showinfo("提示", "压缩包内没有图片或视频文件。")
                 return
-
-            # 按顶层目录分组（作为章节）；无子目录的条目归入「根目录」
-            groups = {}
-            flat = []
-            for n in names:
-                parts = n.replace("\\", "/").split("/")
-                if len(parts) > 1 and parts[0]:
-                    groups.setdefault(parts[0], []).append(n)
-                else:
-                    flat.append(n)
-
-            def sort_names(lst):
-                return sorted(lst, key=lambda n: natural_key(n.replace("\\", "/").split("/")[-1]))
-
-            chapters = []
-            if flat:
-                chapters.append({"title": "根目录", "sources": [(p, n) for n in sort_names(flat)]})
-            for top in sorted(groups, key=natural_key):
-                chapters.append({"title": top, "sources": [(p, n) for n in sort_names(groups[top])]})
 
             self._close_zip()
             self._zip = zipfile.ZipFile(p)
@@ -963,26 +903,11 @@ class ComicViewer(tk.Tk):
 
     def _media_files_in(self, directory):
         """递归收集目录下的图片/视频/PDF，按相对路径自然排序。"""
-        out = []
-        for root, dirs, files in os.walk(directory):
-            dirs.sort(key=natural_key)
-            for f in sorted(files, key=natural_key):
-                if os.path.splitext(f)[1].lower() in (IMAGE_EXTS | VIDEO_EXTS | PDF_EXTS):
-                    out.append(os.path.join(root, f))
-        out.sort(key=lambda p: natural_key(os.path.relpath(p, directory)))
-        return out
+        return media_files_in(directory)
 
     def _expand_sources(self, paths):
         """把文件路径列表转成页面来源列表（PDF 展开为每页）。"""
-        sources = []
-        for p in paths:
-            if os.path.splitext(p)[1].lower() in PDF_EXTS:
-                n = self._pdf_page_count(p)
-                if n > 0:
-                    sources.extend((p, i) for i in range(n))
-            else:
-                sources.append(p)
-        return sources
+        return expand_paths(paths, self._pdf_page_count)
 
     def _load_chapters(self, chapters, book_key):
         if not chapters:
@@ -1175,18 +1100,7 @@ class ComicViewer(tk.Tk):
             # 打开另一个视频，卡死在 libvlc_media_player_stop）。GDI 纯 CPU 渲染
             # 不经过 GPU 驱动，绕开这个死锁；代价是高清视频软渲染更吃 CPU，但
             # 漫画里的短视频通常够用。
-            args = [
-                "--avcodec-hw=none", "--vout=wingdi",
-                # 不接管鼠标/键盘事件：让滚轮 / 触控板手势 / 快捷键传到 Tk
-                # （否则 VLC 会把 F=全屏、空格=暂停、回车=导航、滚轮=音量 都自己吃掉）
-                "--no-mouse-events", "--no-keyboard-events",
-            ]
-            # 视频旋转：transform 滤镜必须是 Instance 级选项（media 级 :video-filter
-            # 在本机 VLC 3.0.20 + set_hwnd 下不会被 vout 继承，实测无效）。
-            # 角度改变时重建实例。
-            if self._video_rotation:
-                args.append("--video-filter=transform")
-                args.append("--transform-type=%d" % self._video_rotation)
+            args = build_vlc_args(self._video_rotation)
             self.vlc_instance = vlc.Instance(args)
             self.player = self.vlc_instance.media_player_new()
             return True
@@ -1197,9 +1111,7 @@ class ComicViewer(tk.Tk):
         if isinstance(src, tuple):
             if src in self._video_cache:
                 return self._video_cache[src]
-            name = src[1].replace("\\", "/").split("/")[-1]
-            ext = os.path.splitext(name)[1].lower()
-            tmp = os.path.join(self._tmp_dir, "v_" + hashlib.md5(src[1].encode("utf-8")).hexdigest()[:12] + ext)
+            tmp = video_tmp_name(src[1], self._tmp_dir)
             try:
                 z = self._zip or zipfile.ZipFile(src[0])
                 with open(tmp, "wb") as f:
@@ -1228,7 +1140,7 @@ class ComicViewer(tk.Tk):
         self._video_ended = False
         self._ab_start_ms = None
         self._ab_end_ms = None
-        self._region_zoom = False
+        self.rz.enabled = False
         self._hide_rz_panel()
         self._transparent_ticks = 0
         self._resume_seek_ms = self._get_resume_position(src)
@@ -1240,11 +1152,7 @@ class ComicViewer(tk.Tk):
             # 关掉 D3D11VA 硬件解码：必须作为 media 选项传才生效（Instance 上的
             # --avcodec-hw=none 在 VLC 3.0.20 里不生效；而且 set_hwnd() 会把
             # avcodec-hw 重置为空）。否则切视频时解码器收尾会死锁。
-            opts = [":avcodec-hw=none", ":rate=%.3f" % self._rate, ":audio-time-stretch"]
-            if self._sub_path:
-                # 外挂字幕文件（.srt/.ass/.sub/.ssa）：交给 VLC 内置字幕解码器
-                # 渲染到画面。set_media 后补一次 sub-file，避免 set_hwnd 把它重置。
-                opts.append(":sub-file=" + self._sub_path.replace("\\", "/"))
+            opts = build_video_media_options(self._rate, self._sub_path)
             media = self.vlc_instance.media_new(path, *opts)
             self.player.set_media(media)
             self.player.set_hwnd(self.video_panel.winfo_id())
@@ -1351,9 +1259,7 @@ class ComicViewer(tk.Tk):
             pass
 
     def _video_resume_key(self, src):
-        if isinstance(src, tuple):
-            return None
-        return os.path.normcase(os.path.abspath(src))
+        return video_resume_key(src)
 
     def _get_resume_position(self, src):
         key = self._video_resume_key(src)
@@ -1393,7 +1299,7 @@ class ComicViewer(tk.Tk):
 
     def zoom_in(self):
         if self.is_video:
-            if self._region_zoom:
+            if self.rz.enabled:
                 self._rz_zoom_step(-0.1)
             else:
                 self.change_video_zoom(0.25)
@@ -1402,7 +1308,7 @@ class ComicViewer(tk.Tk):
 
     def zoom_out(self):
         if self.is_video:
-            if self._region_zoom:
+            if self.rz.enabled:
                 self._rz_zoom_step(0.1)
             else:
                 self.change_video_zoom(-0.25)
@@ -1432,7 +1338,7 @@ class ComicViewer(tk.Tk):
             return
         try:
             # 区域放大：裁剪框由 _apply_region_zoom 设置，这里 scale=0 让裁剪区铺满。
-            if self._region_zoom:
+            if self.rz.enabled:
                 self.player.video_set_scale(0)
             # 全屏下默认自动铺满：scale=0 让 libVLC 按屏幕自适应（保持比例、完整显示）。
             # 用户在全屏里手动 +/− 缩放后 _video_fs_fit 变 False，改用显式倍率。
@@ -1443,29 +1349,17 @@ class ComicViewer(tk.Tk):
         except Exception:
             pass
 
-    def _clamp_rz_center(self):
-        lo = self._rz_scale / 2.0
-        hi = 1.0 - lo
-        self._rz_cx = clamp(self._rz_cx, lo, hi)
-        self._rz_cy = clamp(self._rz_cy, lo, hi)
-
     def _apply_region_zoom(self):
         """区域放大：用裁剪框 crop 出局部区域再铺满；关闭时清除裁剪。"""
         if not self.player or not self.is_video or self._video_is_stopping():
             return
         try:
-            if self._region_zoom:
+            if self.rz.enabled:
                 w, h = self.player.video_get_size()
                 if w <= 0 or h <= 0:
                     return
-                box_w = max(1, int(round(w * self._rz_scale)))
-                box_h = max(1, int(round(h * self._rz_scale)))
-                self._clamp_rz_center()
-                x = int(round(self._rz_cx * w - box_w / 2.0))
-                y = int(round(self._rz_cy * h - box_h / 2.0))
-                # 裁剪格式（实测）："WxH+X+Y" 中 W/H 是右下角坐标，X/Y 是左上角坐标，
-                # 即裁剪矩形 = [X, W] x [Y, H]。所以右下角要传 x+box_w / y+box_h。
-                self.player.video_set_crop_geometry("%dx%d+%d+%d" % (x + box_w, y + box_h, x, y))
+                crop = self.rz.crop_geometry(w, h)
+                self.player.video_set_crop_geometry(crop)
             else:
                 self.player.video_set_crop_geometry("")
             self._apply_video_zoom()
@@ -1475,11 +1369,11 @@ class ComicViewer(tk.Tk):
     def toggle_region_zoom(self):
         if not self.is_video or self._cast_mode == "dlna":
             return
-        self._region_zoom = not self._region_zoom
-        if self._region_zoom:
-            self._rz_cx = self._rz_cy = 0.5
-            self._rz_scale = 0.5
+        self.rz.enabled = not self.rz.enabled
+        if self.rz.enabled:
+            self.rz.reset()
             self._show_rz_panel()
+            self._make_video_window_transparent()   # 确保放大框可被鼠标拖拽（窗口可能已重建）
             self._apply_region_zoom()
             self._update_status()
             self.status.configure(text="区域放大：方向键 / WASD 平移 · 滚轮 / +- 缩放 · 面板按钮也可用 · Z 退出")
@@ -1489,21 +1383,17 @@ class ComicViewer(tk.Tk):
             self._update_status()
 
     def _rz_zoom_step(self, d_scale):
-        self._rz_scale = clamp(round(self._rz_scale + d_scale, 2), 0.1, 1.0)
-        self._clamp_rz_center()
+        self.rz.zoom_step(d_scale)
         self._apply_region_zoom()
         self._update_status()
 
     def _rz_reset_center(self):
-        self._rz_cx = self._rz_cy = 0.5
-        self._clamp_rz_center()
+        self.rz.reset_center()
         self._apply_region_zoom()
         self._update_status()
 
     def _rz_pan(self, dx, dy):
-        self._rz_cx += dx * 0.08
-        self._rz_cy += dy * 0.08
-        self._clamp_rz_center()
+        self.rz.pan(dx * 0.08, dy * 0.08)
         self._apply_region_zoom()
         self._update_status()
 
@@ -1524,25 +1414,25 @@ class ComicViewer(tk.Tk):
         win.resizable(False, False)
         self._rz_panel = win
 
-        def mk(txt, cmd, w=2):
-            return tk.Button(win, text=txt, command=cmd, width=w, takefocus=0,
+        def mk(parent, txt, cmd, w=2):
+            return tk.Button(parent, text=txt, command=cmd, width=w, takefocus=0,
                              bg=BTN_BG, fg=FG, activebackground=BTN_ACTIVE, activeforeground="#fff",
                              relief="flat", bd=0, pady=6, font=("Microsoft YaHei", 11),
                              cursor="hand2")
 
         grid = tk.Frame(win, bg="#1a1d24")
         grid.pack(padx=8, pady=8)
-        mk("↑", lambda: self._rz_pan(0, -1)).grid(row=0, column=1, padx=2, pady=2)
-        mk("←", lambda: self._rz_pan(-1, 0)).grid(row=1, column=0, padx=2, pady=2)
-        mk("·", None, w=2).grid(row=1, column=1, padx=2, pady=2)
-        mk("→", lambda: self._rz_pan(1, 0)).grid(row=1, column=2, padx=2, pady=2)
-        mk("↓", lambda: self._rz_pan(0, 1)).grid(row=2, column=1, padx=2, pady=2)
-        mk("＋", lambda: self._rz_zoom_step(-0.1), w=2).grid(row=0, column=3, padx=2, pady=2)
-        mk("－", lambda: self._rz_zoom_step(0.1), w=2).grid(row=1, column=3, padx=2, pady=2)
+        mk(grid, "↑", lambda: self._rz_pan(0, -1)).grid(row=0, column=1, padx=2, pady=2)
+        mk(grid, "←", lambda: self._rz_pan(-1, 0)).grid(row=1, column=0, padx=2, pady=2)
+        mk(grid, "·", None, w=2).grid(row=1, column=1, padx=2, pady=2)
+        mk(grid, "→", lambda: self._rz_pan(1, 0)).grid(row=1, column=2, padx=2, pady=2)
+        mk(grid, "↓", lambda: self._rz_pan(0, 1)).grid(row=2, column=1, padx=2, pady=2)
+        mk(grid, "＋", lambda: self._rz_zoom_step(-0.1), w=2).grid(row=0, column=3, padx=2, pady=2)
+        mk(grid, "－", lambda: self._rz_zoom_step(0.1), w=2).grid(row=1, column=3, padx=2, pady=2)
         row2 = tk.Frame(win, bg="#1a1d24")
         row2.pack(pady=(0, 8))
-        mk("居中", lambda: self._rz_reset_center(), w=4).pack(side="left", padx=4)
-        mk("退出", lambda: self.toggle_region_zoom(), w=4).pack(side="left", padx=4)
+        mk(row2, "居中", lambda: self._rz_reset_center(), w=4).pack(side="left", padx=4)
+        mk(row2, "退出", lambda: self.toggle_region_zoom(), w=4).pack(side="left", padx=4)
 
         win.update_idletasks()
         try:
@@ -2048,7 +1938,7 @@ class ComicViewer(tk.Tk):
         # 而直接返回，避免在后台 stop 进行中误触 player。
         self._save_resume_position()
         self.is_video = False
-        self._region_zoom = False
+        self.rz.enabled = False
         self._hide_rz_panel()
         self._stop_captions()
         self._stop_player()
@@ -2367,11 +2257,11 @@ class ComicViewer(tk.Tk):
             pass
         self._video_timer = self.after(500, self._update_video_time_loop)
 
-        # 播放初期持续把 VLC 原生窗口设为鼠标穿透（窗口可能延迟创建，每 ~1s 重试）
-        if self._transparent_ticks < 16:
-            self._transparent_ticks += 1
-            if self._transparent_ticks % 2 == 0:
-                self._make_video_window_transparent()
+        # 持续把 VLC 原生窗口设为鼠标穿透（窗口可能延迟创建，也可能在播放中重建，
+        # 每 ~1s 重试；已钩过的窗口会跳过，代价很低）。
+        self._transparent_ticks += 1
+        if self._transparent_ticks % 2 == 0:
+            self._make_video_window_transparent()
 
         # 刷新视频条上的字幕/速率按钮状态（~2Hz，轻量，避免手动在各处重绘）
         try:
@@ -2647,10 +2537,7 @@ class ComicViewer(tk.Tk):
 
     @staticmethod
     def _fmt_time(ms):
-        if ms < 0:
-            ms = 0
-        s = ms // 1000
-        return "%d:%02d" % (s // 60, s % 60)
+        return fmt_time(ms)
 
     # ---------------- 显示 ----------------
     def show_file(self, i):
@@ -2699,10 +2586,7 @@ class ComicViewer(tk.Tk):
         src = self._spread_img if self._spread_img is not None else self.orig
         if not src:
             return 1, 1
-        w, h = src.size
-        if self.rotation % 180 == 90:
-            w, h = h, w
-        return w, h
+        return rotated_size(src.size[0], src.size[1], self.rotation)
 
     def _compute_zoom(self):
         if not self.orig:
@@ -2710,17 +2594,7 @@ class ComicViewer(tk.Tk):
         cw = max(self.canvas.winfo_width(), 1)
         ch = max(self.canvas.winfo_height(), 1)
         rw, rh = self._rotated_size()
-        if self.fit_mode == "width":
-            z = cw / rw
-        elif self.fit_mode == "height":
-            z = ch / rh
-        elif self.fit_mode == "window":
-            z = min(cw / rw, ch / rh)
-        elif self.fit_mode == "actual":
-            z = 1.0
-        else:
-            z = self.zoom
-        return clamp(z, MIN_ZOOM, MAX_ZOOM)
+        return compute_zoom(self.fit_mode, self.zoom, cw, ch, rw, rh)
 
     def _render(self):
         if not self.orig:
@@ -2765,11 +2639,7 @@ class ComicViewer(tk.Tk):
         cw = max(self.canvas.winfo_width(), 1)
         ch = max(self.canvas.winfo_height(), 1)
         rw, rh = self._rotated_size()
-        rw, rh = rw * self.zoom, rh * self.zoom
-        maxx = 0 if rw <= cw else (rw - cw) / 2 + MIN_VISIBLE
-        maxy = 0 if rh <= ch else (rh - ch) / 2 + MIN_VISIBLE
-        self.pan_x = clamp(self.pan_x, -maxx, maxx)
-        self.pan_y = clamp(self.pan_y, -maxy, maxy)
+        self.pan_x, self.pan_y = clamp_pan(self.pan_x, self.pan_y, cw, ch, rw, rh, self.zoom)
 
     # ---------------- 操作 ----------------
     def next(self):
@@ -3045,8 +2915,7 @@ class ComicViewer(tk.Tk):
         f = new_zoom / self.zoom
         cw = max(self.canvas.winfo_width(), 1)
         ch = max(self.canvas.winfo_height(), 1)
-        self.pan_x = self.pan_x * f + (x - cw / 2) * (1 - f)
-        self.pan_y = self.pan_y * f + (y - ch / 2) * (1 - f)
+        self.pan_x, self.pan_y = zoom_at_pan(self.pan_x, self.pan_y, x, y, cw, ch, f)
         self.zoom = new_zoom
         self.fit_mode = "custom"
         self._clamp_pan()
@@ -3054,6 +2923,70 @@ class ComicViewer(tk.Tk):
 
     def zoom_center(self, f):
         self.zoom_at(self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2, f)
+
+    # ---------------- 缩放滑块（scale 百分比条） ----------------
+    def _zoom_range(self):
+        # 视频缩放范围 0.5x..4x，图片 2%..4000%
+        return (0.5, 4.0) if self.is_video else (MIN_ZOOM, MAX_ZOOM)
+
+    def _zoom_slider_value(self, pos):
+        """滑块 0..1000 -> 真实缩放倍率（对数刻度，拖动手感均匀）。"""
+        lo, hi = self._zoom_range()
+        return zoom_slider_value(pos, lo, hi)
+
+    def _zoom_slider_pos(self, z):
+        """真实缩放倍率 -> 滑块 0..1000（对数刻度）。"""
+        lo, hi = self._zoom_range()
+        return zoom_slider_pos(z, lo, hi)
+
+    def _sync_zoom_slider(self):
+        if not hasattr(self, "zoom_slider"):
+            return
+        z = self._video_zoom if self.is_video else self.zoom
+        self._zoom_slider_guard = True
+        try:
+            self.zoom_slider.set(self._zoom_slider_pos(z))
+        finally:
+            self._zoom_slider_guard = False
+
+    def _on_zoom_slider(self, val):
+        if getattr(self, "_zoom_slider_guard", False):
+            return
+        if not (self.orig or self.is_video):
+            return
+        z = self._zoom_slider_value(val)
+        if self.is_video:
+            self._video_zoom = clamp(round(z, 2), 0.5, 4.0)
+            if self.attributes("-fullscreen"):
+                self._video_fs_fit = False   # 手动缩放后不再自动铺满
+            self._apply_video_zoom()
+            self._save_video_options()
+            self._update_status()
+            return
+        # 图片页：即时更新百分比，重绘做轻量节流避免大图卡顿
+        old = max(self.zoom, 1e-6)
+        self.zoom = clamp(z, MIN_ZOOM, MAX_ZOOM)
+        f = self.zoom / old
+        self.pan_x *= f
+        self.pan_y *= f
+        self.fit_mode = "custom"
+        self._clamp_pan()
+        self.zoom_label.configure(text="%d%%" % int(round(self.zoom * 100)))
+        if self._zoom_slider_after:
+            self.after_cancel(self._zoom_slider_after)
+        self._zoom_slider_after = self.after(25, self._zoom_slider_render)
+
+    def _zoom_slider_render(self):
+        self._zoom_slider_after = None
+        if not self.is_video and self.orig:
+            self._render()
+
+    def _on_zoom_label_click(self, _e):
+        # 点击百分比 => 重置画面（图片：适应窗口；视频：恢复 100%）
+        if self.is_video:
+            self.reset_video_zoom()
+        elif self.orig:
+            self.set_fit("window")
 
     def toggle_fullscreen(self):
         entering_fullscreen = not self.attributes("-fullscreen")
@@ -3232,7 +3165,7 @@ class ComicViewer(tk.Tk):
         # 视频页：滚轮 => 音量；区域放大模式下 => 缩放放大框大小
         if e.state & 0x0004:
             return
-        if self._region_zoom:
+        if self.rz.enabled:
             self._rz_zoom_step(-0.1 if e.delta > 0 else 0.1)
         else:
             self._apply_video_wheel(e.delta)
@@ -3284,13 +3217,13 @@ class ComicViewer(tk.Tk):
         # 区域放大模式：开始拖拽平移放大框；否则单击 => 播放 / 暂停
         if not self.is_video:
             return
-        if self._region_zoom:
-            self._rz_drag = dict(x=e.x, y=e.y, cx=self._rz_cx, cy=self._rz_cy, moved=False)
+        if self.rz.enabled:
+            self._rz_drag = dict(x=e.x, y=e.y, cx=self.rz.cx, cy=self.rz.cy, moved=False)
         else:
             self._toggle_play()
 
     def _on_video_motion(self, e):
-        if not (self.is_video and self._region_zoom and self._rz_drag):
+        if not (self.is_video and self.rz.enabled and self._rz_drag):
             return
         dx = e.x - self._rz_drag["x"]
         dy = e.y - self._rz_drag["y"]
@@ -3298,9 +3231,9 @@ class ComicViewer(tk.Tk):
             self._rz_drag["moved"] = True
         pw = max(self.video_panel.winfo_width(), 1)
         ph = max(self.video_panel.winfo_height(), 1)
-        self._rz_cx = self._rz_drag["cx"] + dx / pw
-        self._rz_cy = self._rz_drag["cy"] + dy / ph
-        self._clamp_rz_center()
+        self.rz.cx = self._rz_drag["cx"] + dx / pw
+        self.rz.cy = self._rz_drag["cy"] + dy / ph
+        self.rz.clamp_center()
         self._apply_region_zoom()
 
     def _on_video_release(self, e):
@@ -3310,14 +3243,13 @@ class ComicViewer(tk.Tk):
         """区域放大模式下用方向键 / WASD 平移放大框（键盘可靠，不受 VLC 原生窗口影响）。"""
         step = 0.1
         if k in ("Left", "a", "A"):
-            self._rz_cx -= step
+            self.rz.pan(-step, 0)
         elif k in ("Right", "d", "D"):
-            self._rz_cx += step
+            self.rz.pan(step, 0)
         elif k in ("Up", "w", "W"):
-            self._rz_cy -= step
+            self.rz.pan(0, -step)
         elif k in ("Down", "s", "S"):
-            self._rz_cy += step
-        self._clamp_rz_center()
+            self.rz.pan(0, step)
         self._apply_region_zoom()
         self._update_status()
 
@@ -3327,7 +3259,7 @@ class ComicViewer(tk.Tk):
         if isinstance(w, (tk.Entry, tk.Text)) and w.winfo_toplevel() is not self:
             return
         k = e.keysym
-        if self.is_video and self._region_zoom and k in ("Left", "Right", "Up", "Down", "w", "W", "a", "A", "s", "S", "d", "D"):
+        if self.is_video and self.rz.enabled and k in ("Left", "Right", "Up", "Down", "w", "W", "a", "A", "s", "S", "d", "D"):
             self._rz_pan_key(k)
         elif self.is_video and k in ("Left", "Right"):
             self._seek_relative((30 if (e.state & 0x0004) else 5) * (1 if k == "Right" else -1))
@@ -3555,6 +3487,7 @@ class ComicViewer(tk.Tk):
     def _update_status(self):
         if not self.sources:
             return
+        self._sync_zoom_slider()
         if self.is_video:
             name = self._display_name(self.sources[self.index])
             self.page_label.configure(text="%d / %d" % (self.index + 1, len(self.sources)))
@@ -3607,6 +3540,8 @@ class ComicViewer(tk.Tk):
             "滚轮 / 触控板上下滑             缩放（以鼠标为中心）\n"
             "触控板捏合（Ctrl+滚轮）          缩放\n"
             "触控板左右滑                   翻页（方向随阅读方向）\n"
+            "工具栏缩放滑块                   拖拽调整缩放百分比\n"
+            "点击缩放百分比                   重置（图片：适应窗口 / 视频：100%）\n"
             "+ / -                          放大 / 缩小\n"
             "拖拽                           平移图片\n"
             "快速左右滑动                   翻页（方向随阅读方向）\n"
