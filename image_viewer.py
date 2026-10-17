@@ -271,6 +271,29 @@ class ComicViewer(tk.Tk):
         self._dbl_pos = None         # (x, y) 点击位置
         self._thumbs_visible = None   # 缩略图是否可见（None=尚未载入过）
         self._video_bar_visible = None
+        # 视频播放自动隐藏 UI（参考 ACG Player）：播放时隐藏菜单栏/工具栏/控制条，
+        # 鼠标滑到窗口上边缘显示顶部菜单、滑到下边缘显示控制条，最大化播放画面。
+        self._menubar = None                  # 原生菜单栏引用（隐藏/恢复用）
+        self._autohide_enabled = self._config.get("_ui_", {}).get("autohide", True)
+        self._autohide_poll = None            # 指针位置轮询 after id
+        self._autohide_last_show = 0.0        # 最近一次显示 UI 的时间戳
+        self._autohide_hidden = False         # 底部控制条当前是否被自动隐藏（视频铺满窗口）
+        self._ov_top = None                   # 浮动顶部菜单覆盖层（Toplevel，参考 ACG Player）
+        self._ov_reposition_after = None      # 覆盖层重新定位的去抖 after id
+        self._seek_preview_win = None         # 进度条悬停/拖动时的画面预览小窗
+        self._seek_preview_label = None
+        self._seeking = False                 # 是否正在拖动进度条
+        self._seek_hovering = False           # 鼠标是否悬停在进度条上
+        self._seek_preview_hover = False      # 鼠标是否悬停在预览图上
+        self._seek_preview_time = 0           # 当前预览对应的时间（ms）
+        self._seek_preview_x = 0              # 当前预览锚定的进度条 x（像素）
+        self._seek_hide_after = None          # 延迟隐藏预览的去抖 after id
+        self._seek_thumbs = []                # [(time_ms, PhotoImage)] 预生成缩略图
+        self._seek_thumbs_src = None          # 缩略图对应的视频 src
+        self._seek_thumbs_busy = False
+        self._thumb_player = None             # 用于生成缩略图的第二播放器（离屏）
+        self._thumb_state = None
+        self._thumb_gen_after = None
         self._thumb_photos = []
         self._thumb_rects = []
 
@@ -293,7 +316,7 @@ class ComicViewer(tk.Tk):
         self._shuffle_playlist = bool(video_cfg.get("shuffle_playlist", False))
         self._video_zoom = clamp(float(video_cfg.get("zoom", 1.0)), 0.5, 4.0)
         self._video_fs_fit = True   # 全屏时自动铺满（scale=0 自适应），手动缩放会临时覆盖
-        self._video_rotation = int(video_cfg.get("rotation", 0)) % 360   # 视频旋转角度 0/90/180/270
+        self._video_rotation = 0   # 视频旋转角度 0/90/180/270（不记忆，每次打开新视频重置）
         adj = video_cfg.get("adjust", {}) or {}
         self._video_adjust = {
             "brightness": clamp(float(adj.get("brightness", 1.0)), 0.0, 2.0),
@@ -480,12 +503,49 @@ class ComicViewer(tk.Tk):
         self.caption_label.pack()
         self.video_panel.bind("<Configure>", lambda e: self._reposition_caption_window())
 
+        # 离屏渲染窗口：第二播放器在这里截图生成进度缩略图（不显示）
+        self._thumb_win = tk.Toplevel(self)
+        self._thumb_win.overrideredirect(True)
+        self._thumb_win.geometry("200x120+9000+9000")
+        self._thumb_frame = tk.Frame(self._thumb_win, bg="black", width=200, height=120)
+        self._thumb_frame.pack()
+
+        # 进度条悬停时的画面预览小窗（缩略图 + 时间）
+        self.seek_preview_win = tk.Toplevel(self)
+        self.seek_preview_win.overrideredirect(True)
+        self.seek_preview_win.attributes("-topmost", True)
+        self.seek_preview_win.withdraw()
+        self.seek_preview_win.configure(bg="#000000")
+        self.seek_preview_label = tk.Label(self.seek_preview_win, bg="#000000", fg="#ffffff",
+                                           font=("Consolas", 12), padx=8, pady=6, compound="bottom",
+                                           cursor="hand2")
+        self.seek_preview_label.pack()
+        self.seek_preview_label.bind("<Button-1>", self._on_seek_preview_click)
+        self.seek_preview_label.bind("<Enter>", self._on_seek_preview_enter)
+        self.seek_preview_label.bind("<Leave>", self._on_seek_preview_leave)
+
         self._sync_toggle_buttons()
 
     def _build_menu(self):
         menubar = tk.Menu(self)
 
         file_menu = tk.Menu(menubar, tearoff=0)
+        view = tk.Menu(menubar, tearoff=0)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        self._populate_menus(file_menu, view, help_menu)
+        menubar.add_cascade(label="文件", menu=file_menu)
+        menubar.add_cascade(label="视图", menu=view)
+        menubar.add_cascade(label="帮助", menu=help_menu)
+
+        self._menubar = menubar
+        self._file_menu = file_menu
+        self._view_menu = view
+        self._help_menu = help_menu
+        self.configure(menu=menubar)
+        self._build_video_menu_overlay()
+
+    def _populate_menus(self, file_menu, view, help_menu):
+        """往三个菜单里填入命令（原生菜单栏与浮动菜单复用同一份）。"""
         file_menu.add_command(label="打开文件夹", command=self.open_folder)
         file_menu.add_command(label="打开图片", command=self.open_files)
         file_menu.add_command(label="打开压缩包 (zip/cbz)", command=self.open_zip)
@@ -495,12 +555,13 @@ class ComicViewer(tk.Tk):
         file_menu.add_command(label="详细信息", command=self.show_details)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self._on_close)
-        menubar.add_cascade(label="文件", menu=file_menu)
 
-        view = tk.Menu(menubar, tearoff=0)
         view.add_command(label="全屏 / 退出全屏", command=self.toggle_fullscreen,
                          accelerator="Enter / F / F11")
         view.add_command(label="显示 / 隐藏缩略图", command=self.toggle_thumbs, accelerator="T")
+        view.add_command(label="播放时自动隐藏菜单/工具栏 开/关", command=self.toggle_autohide)
+        view.add_command(label="上一张", command=self.prev)
+        view.add_command(label="下一张", command=self.next)
         view.add_command(label="上一话", command=self.prev_chapter)
         view.add_command(label="下一话", command=self.next_chapter)
         view.add_separator()
@@ -542,15 +603,10 @@ class ComicViewer(tk.Tk):
         view.add_command(label="投屏到电视 / 设备", command=self.toggle_cast)
         view.add_separator()
         view.add_command(label="视频截图（多帧合成高清）", command=self._video_screenshot, accelerator="P")
-        menubar.add_cascade(label="视图", menu=view)
 
-        help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="使用帮助", command=self.show_help, accelerator="?")
         help_menu.add_command(label="AI 字幕翻译设置", command=self._open_ai_settings)
         help_menu.add_command(label="打开/关闭同名字幕自动加载", command=self.toggle_subtitle_load)
-        menubar.add_cascade(label="帮助", menu=help_menu)
-
-        self.configure(menu=menubar)
 
     def _reposition_caption_window(self):
         if not self.caption_window.winfo_viewable():
@@ -626,12 +682,18 @@ class ComicViewer(tk.Tk):
 
         self.bind_all("<Key>", self._on_key)
         self.bind_all("<F11>", lambda e: self.toggle_fullscreen())
+        self.bind("<Configure>", self._on_window_configure)
         # 视频页：滚轮 / 触控板手势 / 单击
         self.bind_all("<MouseWheel>", self._on_video_wheel)
         self.bind_all("<Shift-MouseWheel>", self._on_video_hwheel)
         self.video_panel.bind("<ButtonPress-1>", self._on_video_press)
         self.video_panel.bind("<B1-Motion>", self._on_video_motion)
         self.video_panel.bind("<ButtonRelease-1>", self._on_video_release)
+        self.seek.bind("<Enter>", self._on_seek_enter)
+        self.seek.bind("<Motion>", self._on_seek_hover)
+        self.seek.bind("<Leave>", self._on_seek_leave)
+        self.seek.bind("<ButtonPress-1>", self._on_seek_press)
+        self.seek.bind("<ButtonRelease-1>", self._on_seek_release)
 
     # ---------------- 配置 / 断点续读 ----------------
     def _load_config(self):
@@ -1123,6 +1185,8 @@ class ComicViewer(tk.Tk):
         return src
 
     def _show_video(self, src):
+        # 兜底：先停掉可能残留的自动隐藏轮询并恢复 UI，避免失败分支遗留隐藏状态。
+        self._stop_autohide()
         if not self._ensure_vlc():
             self.is_video = False
             self.status.configure(text="无法播放视频（缺少 VLC）：" + self._display_name(src))
@@ -1178,6 +1242,8 @@ class ComicViewer(tk.Tk):
             self.status.configure(text="视频播放失败：%s" % e)
             return
         self._show_video_bar()
+        self._start_autohide()
+        self._start_seek_thumbs(src, path)
         self._update_status()
         self._update_video_time_loop()
 
@@ -1292,7 +1358,6 @@ class ComicViewer(tk.Tk):
             "repeat_playlist": self._repeat_playlist,
             "shuffle_playlist": self._shuffle_playlist,
             "zoom": self._video_zoom,
-            "rotation": self._video_rotation,
             "adjust": dict(self._video_adjust),
         })
         self._save_config()
@@ -1343,6 +1408,9 @@ class ComicViewer(tk.Tk):
             # 全屏下默认自动铺满：scale=0 让 libVLC 按屏幕自适应（保持比例、完整显示）。
             # 用户在全屏里手动 +/− 缩放后 _video_fs_fit 变 False，改用显式倍率。
             elif self.attributes("-fullscreen") and self._video_fs_fit:
+                self.player.video_set_scale(0)
+            # 窗口化播放时若底部控制条已自动隐藏（视频铺满窗口），同样用 scale=0 自适应铺满。
+            elif not self.attributes("-fullscreen") and self._autohide_hidden:
                 self.player.video_set_scale(0)
             else:
                 self.player.video_set_scale(self._video_zoom)
@@ -1879,6 +1947,7 @@ class ComicViewer(tk.Tk):
         self.is_video = True
         self.play_btn.configure(text="⏸")
         self._show_video_bar()
+        self._start_autohide()
         self._sync_toggle_buttons()
         self._update_status()
         self._update_video_time_loop()
@@ -1923,6 +1992,9 @@ class ComicViewer(tk.Tk):
         if self._video_timer:
             self.after_cancel(self._video_timer)
             self._video_timer = None
+        self._seeking = False
+        self._hide_seek_preview()
+        self._cancel_seek_thumbs()
         if self._cast_mode == "dlna":
             # DLNA 投屏模式：保存投影仪位置，停 DLNA，不碰 VLC
             self._save_dlna_position()
@@ -1931,6 +2003,7 @@ class ComicViewer(tk.Tk):
             self._sync_toggle_buttons()
             self.is_video = False
             self._stop_captions()
+            self._stop_autohide()
             self._hide_video_bar()
             return
         # 先置位：_stop_player 会 pump Tk 事件，期间若有残留的 after 回调
@@ -1941,6 +2014,7 @@ class ComicViewer(tk.Tk):
         self.rz.enabled = False
         self._hide_rz_panel()
         self._stop_captions()
+        self._stop_autohide()
         self._stop_player()
         self._hide_video_bar()
 
@@ -1997,6 +2071,197 @@ class ComicViewer(tk.Tk):
     def _hide_video_bar(self):
         if self.video_bar.winfo_manager():
             self.video_bar.pack_forget()
+
+    # ---------------- 视频播放自动隐藏 UI（参考 ACG Player） ----------------
+    def _set_menu_visible(self, show):
+        """显示 / 隐藏顶部原生菜单栏。"""
+        try:
+            self.configure(menu=self._menubar if show else "")
+        except Exception:
+            pass
+
+    def _build_video_menu_overlay(self):
+        """浮动顶部菜单覆盖层：文件/视图/帮助（Toplevel，不随视频缩放）。"""
+        ov = tk.Toplevel(self)
+        ov.overrideredirect(True)
+        ov.attributes("-topmost", True)
+        ov.withdraw()
+        ov.configure(bg=PANEL)
+        bar = tk.Frame(ov, bg=PANEL, padx=6, pady=2)
+        bar.pack(fill="x")
+
+        # Menubutton 要求 menu 是自己的子菜单；这里为浮动菜单创建独立 Menu 对象
+        # （与原生菜单栏的菜单分开，但命令内容相同）。
+        def mk_menubutton(label):
+            mb = tk.Menubutton(bar, text=label, takefocus=0,
+                               bg=PANEL, fg=FG, activebackground=BTN_ACTIVE,
+                               activeforeground="#fff", relief="flat", bd=0,
+                               padx=10, pady=2, cursor="hand2",
+                               font=("Microsoft YaHei", 10))
+            mb.pack(side="left", padx=2)
+            return mb
+
+        mb_file = mk_menubutton("文件")
+        mb_view = mk_menubutton("视图")
+        mb_help = mk_menubutton("帮助")
+        ov_file = tk.Menu(mb_file, tearoff=0)
+        ov_view = tk.Menu(mb_view, tearoff=0)
+        ov_help = tk.Menu(mb_help, tearoff=0)
+        self._populate_menus(ov_file, ov_view, ov_help)
+        mb_file.configure(menu=ov_file)
+        mb_view.configure(menu=ov_view)
+        mb_help.configure(menu=ov_help)
+        self._ov_file_menu = ov_file
+        self._ov_view_menu = ov_view
+        self._ov_help_menu = ov_help
+        self._ov_top = ov
+
+    def _ov_top_show(self, show):
+        """显示 / 隐藏浮动顶部菜单覆盖层（幂等，避免反复 deiconify/geometry 干扰点击）。"""
+        if self._ov_top is None:
+            return
+        if show:
+            if not self._ov_top.winfo_viewable():
+                self._reposition_video_overlays()
+                self._ov_top.deiconify()
+            self._ov_top.lift()
+        else:
+            self._ov_top.withdraw()
+
+    def _reposition_video_overlays(self):
+        """让浮动菜单覆盖层贴合主窗口顶部（随窗口移动/缩放）。"""
+        if self._ov_top is None:
+            return
+        self.update_idletasks()
+        x = self.winfo_rootx()
+        y = self.winfo_rooty()
+        w = max(self.winfo_width(), 1)
+        th = self._ov_top.winfo_reqheight()
+        self._ov_top.geometry("%dx%d+%d+%d" % (w, th, x, y))
+
+    def _on_window_configure(self, e=None):
+        if not self.is_video:
+            return
+        if self._ov_reposition_after:
+            self.after_cancel(self._ov_reposition_after)
+        self._ov_reposition_after = self.after(80, self._reposition_video_overlays)
+
+    def _menu_is_open(self):
+        """是否有下拉菜单正在展开（展开时不要收起浮动菜单）。"""
+        try:
+            for m in (self._ov_file_menu, self._ov_view_menu, self._ov_help_menu):
+                if m.winfo_ismapped():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _enter_video_chrome(self):
+        """视频模式：隐藏顶部 docked 原生菜单栏/工具栏/章节条，让视频上沿铺满。"""
+        self._set_menu_visible(False)
+        if self.toolbar_outer.winfo_manager():
+            self.toolbar_outer.pack_forget()
+        if self.chapter_bar.winfo_manager():
+            self.chapter_bar.pack_forget()
+
+    def _exit_video_chrome(self):
+        """退出视频：恢复顶部 docked UI。"""
+        self._set_menu_visible(True)
+        if not self.toolbar_outer.winfo_manager():
+            self.toolbar_outer.pack(side="top", fill="x", before=self.content)
+        if self._chapters and len(self._chapters) > 1 and not self.chapter_bar.winfo_manager():
+            self.chapter_bar.pack(side="top", fill="x", before=self.content)
+
+    def _autohide_bottom(self, show):
+        """显示 / 隐藏底部 UI：视频控制条 + 状态栏（保留原 pack 行为）。"""
+        if show:
+            if not self.status.winfo_manager():
+                self.status.pack(side="bottom", fill="x")
+            if not self.video_bar.winfo_manager():
+                self.video_bar.pack(side="bottom", fill="x", before=self.status)
+        else:
+            if self.video_bar.winfo_manager():
+                self.video_bar.pack_forget()
+            if self.status.winfo_manager():
+                self.status.pack_forget()
+
+    def _start_autohide(self):
+        """进入视频播放时启动：顶部用浮动菜单，底部控制条短暂显示后自动隐藏。"""
+        if self._autohide_poll:
+            self.after_cancel(self._autohide_poll)
+            self._autohide_poll = None
+        if not self._autohide_enabled:
+            return
+        self._enter_video_chrome()
+        self._ov_top_show(True)
+        self._autohide_last_show = time.time()
+        self._autohide_hidden = False
+        self._autohide_poll = self.after(250, self._autohide_tick)
+
+    def _stop_autohide(self):
+        """停止轮询：收起浮动菜单，恢复顶部 docked UI 与状态栏。"""
+        if self._autohide_poll:
+            self.after_cancel(self._autohide_poll)
+            self._autohide_poll = None
+        self._autohide_hidden = False
+        self._ov_top_show(False)
+        if self._ui_hidden:
+            # 全屏沉浸式由 _show_ui 统一恢复，这里不干预
+            return
+        self._exit_video_chrome()
+        if not self.status.winfo_manager():
+            self.status.pack(side="bottom", fill="x")
+
+    def _autohide_tick(self):
+        self._autohide_poll = None
+        if not (self.is_video and self._autohide_enabled):
+            return
+        root_x, root_y = self.winfo_rootx(), self.winfo_rooty()
+        w, h = self.winfo_width(), self.winfo_height()
+        px, py = self.winfo_pointerx(), self.winfo_pointery()
+        inside = root_x <= px <= root_x + w and root_y <= py <= root_y + h
+        rel_y = py - root_y
+        top_band = 48        # 顶部悬停触发区（浮动菜单高度约 30px）
+        bottom_band = 112    # 底部悬停触发区（视频条 + 状态栏大约高度）
+        if (inside and rel_y <= top_band) or self._menu_is_open():
+            self._ov_top_show(True)
+            self._autohide_bottom(False)
+            self._autohide_last_show = time.time()
+            changed = not self._autohide_hidden
+            self._autohide_hidden = True
+        elif inside and rel_y >= h - bottom_band:
+            self._ov_top_show(False)
+            self._autohide_bottom(True)
+            self._autohide_last_show = time.time()
+            changed = self._autohide_hidden
+            self._autohide_hidden = False
+        else:
+            changed = False
+            if time.time() - self._autohide_last_show > 2.2:
+                self._ov_top_show(False)
+                self._autohide_bottom(False)
+                self._autohide_last_show = 0.0
+                changed = not self._autohide_hidden
+                self._autohide_hidden = True
+        if changed:
+            self.update_idletasks()
+            self._apply_video_zoom()
+        self._autohide_poll = self.after(250, self._autohide_tick)
+
+    def toggle_autohide(self):
+        """切换「播放时自动隐藏菜单/工具栏」。"""
+        self._autohide_enabled = not self._autohide_enabled
+        self._config.setdefault("_ui_", {})["autohide"] = self._autohide_enabled
+        self._save_config()
+        if not self.is_video:
+            return
+        if self._autohide_enabled:
+            self._start_autohide()
+        else:
+            self._stop_autohide()
+            if not self._ui_hidden and not self.video_bar.winfo_manager():
+                self.video_bar.pack(side="bottom", fill="x", before=self.status)
+            self._apply_video_zoom()
 
     def _show_video_panel(self):
         if not self.video_panel.winfo_manager():
@@ -2061,6 +2326,235 @@ class ComicViewer(tk.Tk):
                     self._captioner.reset()
         except Exception:
             pass
+
+    # ---------------- 进度条悬停预览（参考 ACG Player） ----------------
+    def _on_seek_enter(self, e):
+        self._seek_hovering = True
+        self._show_seek_preview_at(e.x)
+
+    def _on_seek_hover(self, e):
+        self._seek_hovering = True
+        self._show_seek_preview_at(e.x)
+
+    def _on_seek_leave(self, e):
+        self._seek_hovering = False
+        if not self._seeking and not self._seek_preview_hover:
+            self._schedule_seek_preview_hide()
+
+    def _on_seek_press(self, e):
+        self._seeking = True
+        self._show_seek_preview_at(e.x)
+
+    def _on_seek_release(self, e):
+        self._seeking = False
+        if not self._seek_hovering and not self._seek_preview_hover:
+            self._schedule_seek_preview_hide()
+
+    def _video_length(self):
+        try:
+            if self._cast_mode == "dlna":
+                return self._dlna_total
+            if self.player and not self._video_is_stopping():
+                return self.player.get_length()
+        except Exception:
+            pass
+        return 0
+
+    def _seek_preview_from_x(self, x):
+        w = max(self.seek.winfo_width(), 1)
+        frac = clamp(x / w, 0.0, 1.0)
+        length = self._video_length()
+        t = int(frac * length) if length > 0 else 0
+        return t, length, self._nearest_seek_thumb(t)
+
+    def _nearest_seek_thumb(self, t):
+        best, best_d = None, None
+        for pos, photo in self._seek_thumbs:
+            d = abs(pos - t)
+            if best_d is None or d < best_d:
+                best_d, best = d, photo
+        return best
+
+    def _show_seek_preview_at(self, x):
+        if not (self.is_video and self.seek.winfo_ismapped()):
+            return
+        t, length, photo = self._seek_preview_from_x(x)
+        self._seek_preview_time = t
+        self._seek_preview_x = x
+        if self._seek_hide_after:
+            self.after_cancel(self._seek_hide_after)
+            self._seek_hide_after = None
+        text = "%s / %s" % (self._fmt_time(t), self._fmt_time(length))
+        if photo is not None:
+            self.seek_preview_label.configure(image=photo, text=text)
+            self.seek_preview_label.image = photo
+        else:
+            self.seek_preview_label.configure(image="", text=text)
+            self.seek_preview_label.image = None
+        self._position_seek_preview()
+        self.seek_preview_win.deiconify()
+        self.seek_preview_win.lift()
+
+    def _position_seek_preview(self):
+        self.update_idletasks()
+        w = self.seek_preview_win.winfo_reqwidth()
+        h = self.seek_preview_win.winfo_reqheight()
+        anchor_x = self.seek.winfo_rootx() + getattr(self, "_seek_preview_x", self.seek.winfo_width() // 2)
+        x = anchor_x - w // 2
+        left = self.winfo_rootx()
+        right = left + max(self.winfo_width(), 1) - w
+        x = max(left, min(x, right))
+        # 紧贴在进度条上方（8px 间距），鼠标稍向上移即到预览图
+        y = self.seek.winfo_rooty() - h - 8
+        self.seek_preview_win.geometry("+%d+%d" % (x, y))
+
+    def _hide_seek_preview(self):
+        if self._seek_hide_after:
+            self.after_cancel(self._seek_hide_after)
+            self._seek_hide_after = None
+        self.seek_preview_win.withdraw()
+
+    def _schedule_seek_preview_hide(self):
+        if self._seek_hide_after:
+            self.after_cancel(self._seek_hide_after)
+        self._seek_hide_after = self.after(520, self._hide_seek_preview)
+
+    def _on_seek_preview_enter(self, e):
+        self._seek_preview_hover = True
+        if self._seek_hide_after:
+            self.after_cancel(self._seek_hide_after)
+            self._seek_hide_after = None
+
+    def _on_seek_preview_leave(self, e):
+        self._seek_preview_hover = False
+        if not self._seeking:
+            self._schedule_seek_preview_hide()
+
+    def _on_seek_preview_click(self, e):
+        self._seek_to_time(self._seek_preview_time)
+        self._hide_seek_preview()
+
+    def _seek_to_time(self, t):
+        if self._cast_mode == "dlna":
+            if self._dlna:
+                try:
+                    self._dlna_pos = t
+                    self._dlna.seek(t)
+                except Exception:
+                    pass
+            return
+        if not self.player or not self.is_video or self._video_is_stopping():
+            return
+        try:
+            self.player.set_time(int(t))
+            if self._captioner is not None:
+                self._captioner.reset()
+            self._last_seek = time.time()
+        except Exception:
+            pass
+
+    # ---------------- 预生成进度缩略图（第二播放器离屏截图，不打断播放） ----------------
+    def _start_seek_thumbs(self, src, path):
+        self._cancel_seek_thumbs()
+        if not self.is_video or self._cast_mode == "dlna":
+            return
+        if self._seek_thumbs_src == src and self._seek_thumbs:
+            return
+        self._seek_thumbs_src = src
+        self._seek_thumbs = []
+        self._seek_thumbs_busy = True
+        try:
+            tp = self.vlc_instance.media_player_new()
+            media = self.vlc_instance.media_new(path)
+            tp.set_media(media)
+            self.update_idletasks()
+            tp.set_hwnd(self._thumb_frame.winfo_id())
+            tp.play()
+            tp.audio_set_mute(True)
+            tp.set_pause(1)   # 暂停后 seek，画面停在目标帧，截图更准确
+        except Exception:
+            self._seek_thumbs_busy = False
+            return
+        self._thumb_player = tp
+        self._thumb_state = {"idx": 0, "total": 12, "waits": 0}
+        self._thumb_gen_after = self.after(400, self._seek_thumb_step)
+
+    def _cancel_seek_thumbs(self):
+        if self._thumb_gen_after:
+            self.after_cancel(self._thumb_gen_after)
+            self._thumb_gen_after = None
+        self._seek_thumbs_busy = False
+        tp, self._thumb_player = self._thumb_player, None
+        self._thumb_state = None
+        if tp is not None:
+            try:
+                tp.stop()
+                tp.release()
+            except Exception:
+                pass
+
+    def _seek_thumb_step(self):
+        self._thumb_gen_after = None
+        tp = self._thumb_player
+        st = self._thumb_state
+        if tp is None or st is None or not self.is_video:
+            self._cancel_seek_thumbs()
+            return
+        if self.sources and self._seek_thumbs_src != self.sources[self.index]:
+            self._cancel_seek_thumbs()
+            return
+        try:
+            length = tp.get_length()
+        except Exception:
+            length = -1
+        if length <= 0:
+            st["waits"] += 1
+            if st["waits"] > 24:
+                self._cancel_seek_thumbs()
+                return
+            self._thumb_gen_after = self.after(300, self._seek_thumb_step)
+            return
+        st["waits"] = 0
+        idx = st["idx"]
+        if idx >= st["total"]:
+            self._cancel_seek_thumbs()
+            return
+        pos = int(length * idx / st["total"])
+        try:
+            tp.set_time(pos)
+        except Exception:
+            pass
+        self._thumb_gen_after = self.after(220, self._seek_thumb_snap, idx, pos)
+
+    def _seek_thumb_snap(self, idx, pos):
+        self._thumb_gen_after = None
+        tp = self._thumb_player
+        if tp is None or not self.is_video:
+            self._cancel_seek_thumbs()
+            return
+        p = os.path.join(self._tmp_dir, "seek_thumb_%d.png" % idx)
+        ok = False
+        try:
+            ok = tp.video_take_snapshot(0, p, 240, 135) == 0
+        except Exception:
+            ok = False
+        if ok:
+            self._thumb_gen_after = self.after(60, self._seek_thumb_load, idx, pos, p)
+        else:
+            self._thumb_state["idx"] = idx + 1
+            self._thumb_gen_after = self.after(80, self._seek_thumb_step)
+
+    def _seek_thumb_load(self, idx, pos, p):
+        self._thumb_gen_after = None
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                img = Image.open(p)
+                self._seek_thumbs.append((pos, ImageTk.PhotoImage(img)))
+        except Exception:
+            pass
+        if self._thumb_state is not None:
+            self._thumb_state["idx"] = idx + 1
+        self._thumb_gen_after = self.after(80, self._seek_thumb_step)
 
     def _on_volume(self, val):
         if self._cast_mode == "dlna":
@@ -2555,6 +3049,8 @@ class ComicViewer(tk.Tk):
         if self._is_video(src):
             self.orig = None
             self._spread_img = None
+            self._video_rotation = 0   # 打开新视频时重置旋转，不记忆上一段的角度
+            self._thumbs_hide_for_video()   # 视频页隐藏缩略图条
             self.canvas.delete("img")
             self._show_video(src)
             self._highlight_thumb()
@@ -2565,6 +3061,7 @@ class ComicViewer(tk.Tk):
 
         self._show_image_panel()
         self.is_video = False
+        self._thumbs_restore()   # 回到图片页按偏好恢复缩略图条
         try:
             self.orig = self._open_image(src)
         except Exception as e:
@@ -3014,7 +3511,19 @@ class ComicViewer(tk.Tk):
             # set_hwnd 重建原生子窗口后，重新设为鼠标穿透
             self.after(300, self._make_video_window_transparent)
 
+    def _thumbs_hide_for_video(self):
+        """视频播放时隐藏缩略图条（保留 _thumbs_visible 偏好，退出视频后恢复）。"""
+        if self.thumbs_frame.winfo_manager():
+            self.thumbs_frame.pack_forget()
+
+    def _thumbs_restore(self):
+        """图片页按用户偏好恢复缩略图条。"""
+        if self._thumbs_visible and not self.thumbs_frame.winfo_manager():
+            self.thumbs_frame.pack(side="bottom", fill="x", before=self.status)
+
     def toggle_thumbs(self):
+        if self.is_video:
+            return  # 视频页不显示缩略图条
         if self._thumbs_visible:
             # 关闭缩略图：隐藏条，清空图形
             self._thumbs_visible = False
@@ -3029,13 +3538,14 @@ class ComicViewer(tk.Tk):
             self._build_thumbnails()
 
     def _hide_ui(self):
-        """隐藏全部 UI（工具栏 / 状态栏 / 缩略图 / 视频条），仅保留画面内容。"""
+        """隐藏全部 UI（工具栏 / 状态栏 / 缩略图 / 视频条 / 浮动菜单），仅保留画面内容。"""
         self._click_tick = 0
         if self.toolbar_outer.winfo_manager():
             self.toolbar_outer.pack_forget()
         self.status.pack_forget()
         self.thumbs_frame.pack_forget()
         self.video_bar.pack_forget()
+        self._ov_top_show(False)
         # 切换内容区：视频面/画布互斥显示
         if self.is_video and self.video_panel.winfo_manager():
             self.video_panel.pack(side="top", fill="both", expand=True)
@@ -3045,21 +3555,32 @@ class ComicViewer(tk.Tk):
         self._ui_hidden = True
 
     def _show_ui(self):
-        """恢复全部 UI：工具栏 + 状态栏 + 缩略图 + 视频条，并按需要重绘画面。"""
-        if self._ui_hidden:
-            self._ui_hidden = False
-            if not self.toolbar_outer.winfo_manager():
-                self.toolbar_outer.pack(side="top", fill="x", before=self.content)
-            self.status.pack(side="bottom", fill="x")
-            if self._thumbs_visible:
-                self.thumbs_frame.pack(side="bottom", fill="x", before=self.status)
-            if self.is_video:
+        """恢复 UI：图片页恢复 docked 布局；视频页顶部用浮动菜单、底部恢复控制条。"""
+        if not self._ui_hidden:
+            return
+        self._ui_hidden = False
+        if self.is_video:
+            if self._autohide_enabled:
+                self._enter_video_chrome()
+                self._ov_top_show(True)
+            else:
+                self._exit_video_chrome()
+            if not self.status.winfo_manager():
+                self.status.pack(side="bottom", fill="x")
+            if not self.video_bar.winfo_manager():
                 self.video_bar.pack(side="bottom", fill="x", before=self.status)
-                if self.video_panel.winfo_manager():
-                    self.after(160, self._after_ui_ready)
-                return
-            if self.canvas.winfo_manager():
+            self._autohide_last_show = time.time()
+            self._autohide_hidden = False
+            if self.video_panel.winfo_manager():
                 self.after(160, self._after_ui_ready)
+            return
+        if not self.toolbar_outer.winfo_manager():
+            self.toolbar_outer.pack(side="top", fill="x", before=self.content)
+        self.status.pack(side="bottom", fill="x")
+        if self._thumbs_visible:
+            self.thumbs_frame.pack(side="bottom", fill="x", before=self.status)
+        if self.canvas.winfo_manager():
+            self.after(160, self._after_ui_ready)
 
     def _after_ui_ready(self):
         """UI 恢复、布局稳定后，按进入隐藏前的状态重做适配。"""
@@ -3549,6 +4070,7 @@ class ComicViewer(tk.Tk):
             "点击画面中间                    显示 / 隐藏工具栏\n"
             "双击画面中间                    适应窗口 <-> 实际大小\n"
             "视频页：空格 / 点击画面中间      播放 / 暂停\n"
+            "视频页：播放时自动隐藏菜单/工具栏，鼠标移到上/下边缘显示（视图菜单可开关）\n"
             "视频页：P / 截图按钮             截图（多帧合成，更清晰）\n"
             "视频页：播放完自动              跳到下一张\n"
             "R / Shift+R                    旋转 90°（图片与视频都支持）\n"

@@ -29,6 +29,7 @@ def build_vlc_args(rotation):
     args = [
         "--avcodec-hw=none", "--vout=wingdi",
         "--no-mouse-events", "--no-keyboard-events",
+        "--quiet",  # 压低 VLC 日志噪音（仅影响日志，不影响解码/渲染/截图）
     ]
     if rotation:
         args.append("--video-filter=transform")
