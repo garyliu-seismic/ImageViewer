@@ -277,7 +277,9 @@ class ComicViewer(tk.Tk):
         self._autohide_enabled = self._config.get("_ui_", {}).get("autohide", True)
         self._autohide_poll = None            # 指针位置轮询 after id
         self._autohide_last_show = 0.0        # 最近一次显示 UI 的时间戳
-        self._autohide_hidden = False         # 顶部+底部 UI 当前是否被自动隐藏（视频铺满窗口）
+        self._autohide_hidden = False         # 底部控制条当前是否被自动隐藏（视频铺满窗口）
+        self._ov_top = None                   # 浮动顶部菜单覆盖层（Toplevel，参考 ACG Player）
+        self._ov_reposition_after = None      # 覆盖层重新定位的去抖 after id
         self._thumb_photos = []
         self._thumb_rects = []
 
@@ -485,7 +487,7 @@ class ComicViewer(tk.Tk):
     def _build_menu(self):
         menubar = tk.Menu(self)
 
-        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu = tk.Menu(self, tearoff=0)
         file_menu.add_command(label="打开文件夹", command=self.open_folder)
         file_menu.add_command(label="打开图片", command=self.open_files)
         file_menu.add_command(label="打开压缩包 (zip/cbz)", command=self.open_zip)
@@ -497,11 +499,13 @@ class ComicViewer(tk.Tk):
         file_menu.add_command(label="退出", command=self._on_close)
         menubar.add_cascade(label="文件", menu=file_menu)
 
-        view = tk.Menu(menubar, tearoff=0)
+        view = tk.Menu(self, tearoff=0)
         view.add_command(label="全屏 / 退出全屏", command=self.toggle_fullscreen,
                          accelerator="Enter / F / F11")
         view.add_command(label="显示 / 隐藏缩略图", command=self.toggle_thumbs, accelerator="T")
         view.add_command(label="播放时自动隐藏菜单/工具栏 开/关", command=self.toggle_autohide)
+        view.add_command(label="上一张", command=self.prev)
+        view.add_command(label="下一张", command=self.next)
         view.add_command(label="上一话", command=self.prev_chapter)
         view.add_command(label="下一话", command=self.next_chapter)
         view.add_separator()
@@ -545,14 +549,18 @@ class ComicViewer(tk.Tk):
         view.add_command(label="视频截图（多帧合成高清）", command=self._video_screenshot, accelerator="P")
         menubar.add_cascade(label="视图", menu=view)
 
-        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu = tk.Menu(self, tearoff=0)
         help_menu.add_command(label="使用帮助", command=self.show_help, accelerator="?")
         help_menu.add_command(label="AI 字幕翻译设置", command=self._open_ai_settings)
         help_menu.add_command(label="打开/关闭同名字幕自动加载", command=self.toggle_subtitle_load)
         menubar.add_cascade(label="帮助", menu=help_menu)
 
         self._menubar = menubar
+        self._file_menu = file_menu
+        self._view_menu = view
+        self._help_menu = help_menu
         self.configure(menu=menubar)
+        self._build_video_menu_overlay()
 
     def _reposition_caption_window(self):
         if not self.caption_window.winfo_viewable():
@@ -628,6 +636,7 @@ class ComicViewer(tk.Tk):
 
         self.bind_all("<Key>", self._on_key)
         self.bind_all("<F11>", lambda e: self.toggle_fullscreen())
+        self.bind("<Configure>", self._on_window_configure)
         # 视频页：滚轮 / 触控板手势 / 单击
         self.bind_all("<MouseWheel>", self._on_video_wheel)
         self.bind_all("<Shift-MouseWheel>", self._on_video_hwheel)
@@ -1348,7 +1357,7 @@ class ComicViewer(tk.Tk):
             # 用户在全屏里手动 +/− 缩放后 _video_fs_fit 变 False，改用显式倍率。
             elif self.attributes("-fullscreen") and self._video_fs_fit:
                 self.player.video_set_scale(0)
-            # 窗口化播放时若 UI 已自动隐藏（视频铺满窗口），同样用 scale=0 自适应铺满。
+            # 窗口化播放时若底部控制条已自动隐藏（视频铺满窗口），同样用 scale=0 自适应铺满。
             elif not self.attributes("-fullscreen") and self._autohide_hidden:
                 self.player.video_set_scale(0)
             else:
@@ -2016,22 +2025,82 @@ class ComicViewer(tk.Tk):
         except Exception:
             pass
 
-    def _autohide_top(self, show):
-        """显示 / 隐藏顶部 UI：菜单栏 + 工具栏 + 章节条。"""
-        self._set_menu_visible(show)
+    def _build_video_menu_overlay(self):
+        """浮动顶部菜单覆盖层：文件/视图/帮助（Toplevel，不随视频缩放）。"""
+        ov = tk.Toplevel(self)
+        ov.overrideredirect(True)
+        ov.attributes("-topmost", True)
+        ov.withdraw()
+        ov.configure(bg=PANEL)
+        bar = tk.Frame(ov, bg=PANEL, padx=6, pady=2)
+        bar.pack(fill="x")
+        for label, menu in (("文件", self._file_menu), ("视图", self._view_menu),
+                            ("帮助", self._help_menu)):
+            mb = tk.Menubutton(bar, text=label, menu=menu, takefocus=0,
+                               bg=PANEL, fg=FG, activebackground=BTN_ACTIVE,
+                               activeforeground="#fff", relief="flat", bd=0,
+                               padx=10, pady=2, cursor="hand2",
+                               font=("Microsoft YaHei", 10))
+            mb.pack(side="left", padx=2)
+        self._ov_top = ov
+
+    def _ov_top_show(self, show):
+        """显示 / 隐藏浮动顶部菜单覆盖层。"""
+        if self._ov_top is None:
+            return
         if show:
-            if not self.toolbar_outer.winfo_manager():
-                self.toolbar_outer.pack(side="top", fill="x", before=self.content)
-            if self._chapters and len(self._chapters) > 1 and not self.chapter_bar.winfo_manager():
-                self.chapter_bar.pack(side="top", fill="x", before=self.content)
+            self._reposition_video_overlays()
+            self._ov_top.deiconify()
+            self._ov_top.lift()
         else:
-            if self.toolbar_outer.winfo_manager():
-                self.toolbar_outer.pack_forget()
-            if self.chapter_bar.winfo_manager():
-                self.chapter_bar.pack_forget()
+            self._ov_top.withdraw()
+
+    def _reposition_video_overlays(self):
+        """让浮动菜单覆盖层贴合主窗口顶部（随窗口移动/缩放）。"""
+        if self._ov_top is None:
+            return
+        self.update_idletasks()
+        x = self.winfo_rootx()
+        y = self.winfo_rooty()
+        w = max(self.winfo_width(), 1)
+        th = self._ov_top.winfo_reqheight()
+        self._ov_top.geometry("%dx%d+%d+%d" % (w, th, x, y))
+
+    def _on_window_configure(self, e=None):
+        if not self.is_video:
+            return
+        if self._ov_reposition_after:
+            self.after_cancel(self._ov_reposition_after)
+        self._ov_reposition_after = self.after(80, self._reposition_video_overlays)
+
+    def _menu_is_open(self):
+        """是否有下拉菜单正在展开（展开时不要收起浮动菜单）。"""
+        try:
+            for m in (self._file_menu, self._view_menu, self._help_menu):
+                if m.winfo_ismapped():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _enter_video_chrome(self):
+        """视频模式：隐藏顶部 docked 原生菜单栏/工具栏/章节条，让视频上沿铺满。"""
+        self._set_menu_visible(False)
+        if self.toolbar_outer.winfo_manager():
+            self.toolbar_outer.pack_forget()
+        if self.chapter_bar.winfo_manager():
+            self.chapter_bar.pack_forget()
+
+    def _exit_video_chrome(self):
+        """退出视频：恢复顶部 docked UI。"""
+        self._set_menu_visible(True)
+        if not self.toolbar_outer.winfo_manager():
+            self.toolbar_outer.pack(side="top", fill="x", before=self.content)
+        if self._chapters and len(self._chapters) > 1 and not self.chapter_bar.winfo_manager():
+            self.chapter_bar.pack(side="top", fill="x", before=self.content)
 
     def _autohide_bottom(self, show):
-        """显示 / 隐藏底部 UI：视频控制条 + 状态栏。"""
+        """显示 / 隐藏底部 UI：视频控制条 + 状态栏（保留原 pack 行为）。"""
         if show:
             if not self.status.winfo_manager():
                 self.status.pack(side="bottom", fill="x")
@@ -2044,24 +2113,29 @@ class ComicViewer(tk.Tk):
                 self.status.pack_forget()
 
     def _start_autohide(self):
-        """进入视频播放时启动：先短暂显示 UI，随后隐藏并按指针位置轮询显示。"""
-        self._stop_autohide()
+        """进入视频播放时启动：顶部用浮动菜单，底部控制条短暂显示后自动隐藏。"""
+        if self._autohide_poll:
+            self.after_cancel(self._autohide_poll)
+            self._autohide_poll = None
         if not self._autohide_enabled:
             return
+        self._enter_video_chrome()
+        self._ov_top_show(True)
         self._autohide_last_show = time.time()
         self._autohide_hidden = False
         self._autohide_poll = self.after(250, self._autohide_tick)
 
     def _stop_autohide(self):
-        """停止轮询，并把顶部 UI / 状态栏恢复到默认可见（视频条由调用方处理）。"""
+        """停止轮询：收起浮动菜单，恢复顶部 docked UI 与状态栏。"""
         if self._autohide_poll:
             self.after_cancel(self._autohide_poll)
             self._autohide_poll = None
         self._autohide_hidden = False
+        self._ov_top_show(False)
         if self._ui_hidden:
             # 全屏沉浸式由 _show_ui 统一恢复，这里不干预
             return
-        self._autohide_top(True)
+        self._exit_video_chrome()
         if not self.status.winfo_manager():
             self.status.pack(side="bottom", fill="x")
 
@@ -2074,16 +2148,16 @@ class ComicViewer(tk.Tk):
         px, py = self.winfo_pointerx(), self.winfo_pointery()
         inside = root_x <= px <= root_x + w and root_y <= py <= root_y + h
         rel_y = py - root_y
-        top_band = 96        # 顶部悬停触发区（菜单栏 + 工具栏大约高度）
+        top_band = 48        # 顶部悬停触发区（浮动菜单高度约 30px）
         bottom_band = 112    # 底部悬停触发区（视频条 + 状态栏大约高度）
-        if inside and rel_y <= top_band:
-            self._autohide_top(True)
+        if (inside and rel_y <= top_band) or self._menu_is_open():
+            self._ov_top_show(True)
             self._autohide_bottom(False)
             self._autohide_last_show = time.time()
-            changed = self._autohide_hidden
-            self._autohide_hidden = False
+            changed = not self._autohide_hidden
+            self._autohide_hidden = True
         elif inside and rel_y >= h - bottom_band:
-            self._autohide_top(False)
+            self._ov_top_show(False)
             self._autohide_bottom(True)
             self._autohide_last_show = time.time()
             changed = self._autohide_hidden
@@ -2091,7 +2165,7 @@ class ComicViewer(tk.Tk):
         else:
             changed = False
             if time.time() - self._autohide_last_show > 2.2:
-                self._autohide_top(False)
+                self._ov_top_show(False)
                 self._autohide_bottom(False)
                 self._autohide_last_show = 0.0
                 changed = not self._autohide_hidden
@@ -3148,13 +3222,14 @@ class ComicViewer(tk.Tk):
             self._build_thumbnails()
 
     def _hide_ui(self):
-        """隐藏全部 UI（工具栏 / 状态栏 / 缩略图 / 视频条），仅保留画面内容。"""
+        """隐藏全部 UI（工具栏 / 状态栏 / 缩略图 / 视频条 / 浮动菜单），仅保留画面内容。"""
         self._click_tick = 0
         if self.toolbar_outer.winfo_manager():
             self.toolbar_outer.pack_forget()
         self.status.pack_forget()
         self.thumbs_frame.pack_forget()
         self.video_bar.pack_forget()
+        self._ov_top_show(False)
         # 切换内容区：视频面/画布互斥显示
         if self.is_video and self.video_panel.winfo_manager():
             self.video_panel.pack(side="top", fill="both", expand=True)
@@ -3164,21 +3239,32 @@ class ComicViewer(tk.Tk):
         self._ui_hidden = True
 
     def _show_ui(self):
-        """恢复全部 UI：工具栏 + 状态栏 + 缩略图 + 视频条，并按需要重绘画面。"""
-        if self._ui_hidden:
-            self._ui_hidden = False
-            if not self.toolbar_outer.winfo_manager():
-                self.toolbar_outer.pack(side="top", fill="x", before=self.content)
-            self.status.pack(side="bottom", fill="x")
-            if self._thumbs_visible:
-                self.thumbs_frame.pack(side="bottom", fill="x", before=self.status)
-            if self.is_video:
+        """恢复 UI：图片页恢复 docked 布局；视频页顶部用浮动菜单、底部恢复控制条。"""
+        if not self._ui_hidden:
+            return
+        self._ui_hidden = False
+        if self.is_video:
+            if self._autohide_enabled:
+                self._enter_video_chrome()
+                self._ov_top_show(True)
+            else:
+                self._exit_video_chrome()
+            if not self.status.winfo_manager():
+                self.status.pack(side="bottom", fill="x")
+            if not self.video_bar.winfo_manager():
                 self.video_bar.pack(side="bottom", fill="x", before=self.status)
-                if self.video_panel.winfo_manager():
-                    self.after(160, self._after_ui_ready)
-                return
-            if self.canvas.winfo_manager():
+            self._autohide_last_show = time.time()
+            self._autohide_hidden = False
+            if self.video_panel.winfo_manager():
                 self.after(160, self._after_ui_ready)
+            return
+        if not self.toolbar_outer.winfo_manager():
+            self.toolbar_outer.pack(side="top", fill="x", before=self.content)
+        self.status.pack(side="bottom", fill="x")
+        if self._thumbs_visible:
+            self.thumbs_frame.pack(side="bottom", fill="x", before=self.status)
+        if self.canvas.winfo_manager():
+            self.after(160, self._after_ui_ready)
 
     def _after_ui_ready(self):
         """UI 恢复、布局稳定后，按进入隐藏前的状态重做适配。"""
