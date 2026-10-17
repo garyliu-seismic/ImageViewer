@@ -2397,7 +2397,8 @@ class ComicViewer(tk.Tk):
         left = self.winfo_rootx()
         right = left + max(self.winfo_width(), 1) - w
         x = max(left, min(x, right))
-        y = self.winfo_rooty() + max(0, self.winfo_height() - h - 150)
+        # 紧贴在进度条上方（8px 间距），鼠标稍向上移即到预览图
+        y = self.seek.winfo_rooty() - h - 8
         self.seek_preview_win.geometry("+%d+%d" % (x, y))
 
     def _hide_seek_preview(self):
@@ -2409,7 +2410,7 @@ class ComicViewer(tk.Tk):
     def _schedule_seek_preview_hide(self):
         if self._seek_hide_after:
             self.after_cancel(self._seek_hide_after)
-        self._seek_hide_after = self.after(260, self._hide_seek_preview)
+        self._seek_hide_after = self.after(520, self._hide_seek_preview)
 
     def _on_seek_preview_enter(self, e):
         self._seek_preview_hover = True
