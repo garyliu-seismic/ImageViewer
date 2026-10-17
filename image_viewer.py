@@ -2398,7 +2398,10 @@ class ComicViewer(tk.Tk):
         self._seek_thumbs_busy = True
         try:
             tp = self.vlc_instance.media_player_new()
-            media = self.vlc_instance.media_new(path)
+            # 第二播放器同样必须关硬件解码：Instance 的 --avcodec-hw=none 在
+            # set_hwnd() 后不生效，需作为 media 选项传，否则走 D3D11 解码会报
+            # “SetThumbNailClip failed / Failed to create video converter” 且截图失败。
+            media = self.vlc_instance.media_new(path, ":avcodec-hw=none")
             tp.set_media(media)
             self.update_idletasks()
             tp.set_hwnd(self._thumb_frame.winfo_id())
