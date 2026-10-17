@@ -29,7 +29,7 @@ class TestBuildVlcArgs(unittest.TestCase):
     def test_base(self):
         args = vp.build_vlc_args(0)
         self.assertEqual(args, ["--avcodec-hw=none", "--vout=wingdi",
-                                "--no-mouse-events", "--no-keyboard-events"])
+                                "--no-mouse-events", "--no-keyboard-events", "--quiet"])
 
     def test_with_rotation(self):
         args = vp.build_vlc_args(90)
