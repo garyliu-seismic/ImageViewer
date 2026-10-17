@@ -334,6 +334,10 @@ class ComicViewer(tk.Tk):
         self._tmp_dir = tempfile.mkdtemp(prefix="image_viewer_")
 
         self.caption_enabled = False
+        # 字幕用 audio_set_callbacks 接管过本播放器的音频后，回调无法真正解绑
+        # （解绑为 None 会崩溃，只能换空回调），之后该播放器永远无声；
+        # 因此下次播放且字幕关闭时需要重建播放器。
+        self._audio_hijacked = False
         self.caption_pos = self._config.get("_ui_", {}).get("caption_pos", "bottom")  # "bottom" | "top"
         self._captioner = None
         self._caption_poll_after = None
@@ -474,11 +478,18 @@ class ComicViewer(tk.Tk):
                                                values=CAPTION_LANGS, state="readonly", width=5)
         self.caption_lang_combo.pack(side="left", padx=(8, 2))
         self.caption_lang_combo.bind("<<ComboboxSelected>>", self._on_caption_lang_change)
+        # 当视频的区域放大模式开启时，阻止语言下拉框使用上下键切换项，
+        # 改为把上下键路由为放大框的平移操作。
+        self.caption_lang_combo.bind("<Up>", lambda e: (self._rz_pan_key("Up"), "break")[1] if (self.is_video and self._region_zoom) else None)
+        self.caption_lang_combo.bind("<Down>", lambda e: (self._rz_pan_key("Down"), "break")[1] if (self.is_video and self._region_zoom) else None)
         self.caption_mode_var = tk.StringVar(value="原声")
         self.caption_mode_combo = ttk.Combobox(self.video_bar, textvariable=self.caption_mode_var,
                                                values=CAPTION_MODES, state="readonly", width=9)
         self.caption_mode_combo.pack(side="left", padx=2)
         self.caption_mode_combo.bind("<<ComboboxSelected>>", self._on_caption_mode_change)
+        # 同样阻止模式下拉框上下键干扰区域放大平移
+        self.caption_mode_combo.bind("<Up>", lambda e: (self._rz_pan_key("Up"), "break")[1] if (self.is_video and self._region_zoom) else None)
+        self.caption_mode_combo.bind("<Down>", lambda e: (self._rz_pan_key("Down"), "break")[1] if (self.is_video and self._region_zoom) else None)
         self.cast_btn = self._state_btn(self.video_bar, "📺 投屏", self.toggle_cast)
         self.shot_btn = self._state_btn(self.video_bar, "📷 截图", self._video_screenshot)
 
@@ -1044,7 +1055,7 @@ class ComicViewer(tk.Tk):
         self._sync_toggle_buttons()
         self._thumbs_visible = True
         if not self.thumbs_frame.winfo_manager():
-            self.thumbs_frame.pack(side="bottom", fill="x", before=self.status)
+            self._pack_thumbs()
         self.show_file(start)
         self._build_thumbnails()
 
@@ -1180,6 +1191,9 @@ class ComicViewer(tk.Tk):
     def _show_video(self, src):
         # 兜底：先停掉可能残留的自动隐藏轮询并恢复 UI，避免失败分支遗留隐藏状态。
         self._stop_autohide()
+        if self._audio_hijacked and not self.caption_enabled:
+            self._audio_hijacked = False
+            self._recreate_vlc()
         if not self._ensure_vlc():
             self.is_video = False
             self.status.configure(text="无法播放视频（缺少 VLC）：" + self._display_name(src))
@@ -2458,12 +2472,14 @@ class ComicViewer(tk.Tk):
         self._seek_thumbs_busy = True
         try:
             tp = self.vlc_instance.media_player_new()
-            media = self.vlc_instance.media_new(path)
+            # 不能用 tp.audio_set_mute(True)：VLC 在 Windows 上的静音是按进程的
+            # WASAPI 会话设置的，会把主播放器也静音，且 Windows 会按 exe 记住该
+            # 静音状态（重启后仍静音）。改为 media 选项直接不开音频输出。
+            media = self.vlc_instance.media_new(path, ":no-audio")
             tp.set_media(media)
             self.update_idletasks()
             tp.set_hwnd(self._thumb_frame.winfo_id())
             tp.play()
-            tp.audio_set_mute(True)
             tp.set_pause(1)   # 暂停后 seek，画面停在目标帧，截图更准确
         except Exception:
             self._seek_thumbs_busy = False
@@ -2870,6 +2886,7 @@ class ComicViewer(tk.Tk):
                 source_lang=lang, caption_mode=mode,
                 ai_cfg=self._config.get("_ai_", {}),
             )
+        self._audio_hijacked = True
         self.caption_label.configure(text="字幕模型加载中…")
         self.caption_window.deiconify()
         self._reposition_caption_window()
@@ -3504,6 +3521,15 @@ class ComicViewer(tk.Tk):
             # set_hwnd 重建原生子窗口后，重新设为鼠标穿透
             self.after(300, self._make_video_window_transparent)
 
+    def _pack_thumbs(self):
+        """打包缩略图条；status 可能已被 pack_forget（隐藏 UI / 视频沉浸模式），
+        此时 before=status 会抛 TclError，需先把 status 放回去（保证 status 在最底部）。"""
+        if self._ui_hidden:
+            return  # _show_ui 恢复时会处理
+        if not self.status.winfo_manager():
+            self.status.pack(side="bottom", fill="x")
+        self.thumbs_frame.pack(side="bottom", fill="x", before=self.status)
+
     def _thumbs_hide_for_video(self):
         """视频播放时隐藏缩略图条（保留 _thumbs_visible 偏好，退出视频后恢复）。"""
         if self.thumbs_frame.winfo_manager():
@@ -3512,7 +3538,7 @@ class ComicViewer(tk.Tk):
     def _thumbs_restore(self):
         """图片页按用户偏好恢复缩略图条。"""
         if self._thumbs_visible and not self.thumbs_frame.winfo_manager():
-            self.thumbs_frame.pack(side="bottom", fill="x", before=self.status)
+            self._pack_thumbs()
 
     def toggle_thumbs(self):
         if self.is_video:
@@ -3527,7 +3553,7 @@ class ComicViewer(tk.Tk):
         else:
             # 打开缩略图：重建
             self._thumbs_visible = True
-            self.thumbs_frame.pack(side="bottom", fill="x", before=self.status)
+            self._pack_thumbs()
             self._build_thumbnails()
 
     def _hide_ui(self):
