@@ -284,6 +284,10 @@ class ComicViewer(tk.Tk):
         self._seek_preview_label = None
         self._seeking = False                 # 是否正在拖动进度条
         self._seek_hovering = False           # 鼠标是否悬停在进度条上
+        self._seek_preview_hover = False      # 鼠标是否悬停在预览图上
+        self._seek_preview_time = 0           # 当前预览对应的时间（ms）
+        self._seek_preview_x = 0              # 当前预览锚定的进度条 x（像素）
+        self._seek_hide_after = None          # 延迟隐藏预览的去抖 after id
         self._seek_thumbs = []                # [(time_ms, PhotoImage)] 预生成缩略图
         self._seek_thumbs_src = None          # 缩略图对应的视频 src
         self._seek_thumbs_busy = False
@@ -506,8 +510,12 @@ class ComicViewer(tk.Tk):
         self.seek_preview_win.withdraw()
         self.seek_preview_win.configure(bg="#000000")
         self.seek_preview_label = tk.Label(self.seek_preview_win, bg="#000000", fg="#ffffff",
-                                           font=("Consolas", 12), padx=8, pady=6, compound="bottom")
+                                           font=("Consolas", 12), padx=8, pady=6, compound="bottom",
+                                           cursor="hand2")
         self.seek_preview_label.pack()
+        self.seek_preview_label.bind("<Button-1>", self._on_seek_preview_click)
+        self.seek_preview_label.bind("<Enter>", self._on_seek_preview_enter)
+        self.seek_preview_label.bind("<Leave>", self._on_seek_preview_leave)
 
         self._sync_toggle_buttons()
 
@@ -2323,8 +2331,8 @@ class ComicViewer(tk.Tk):
 
     def _on_seek_leave(self, e):
         self._seek_hovering = False
-        if not self._seeking:
-            self._hide_seek_preview()
+        if not self._seeking and not self._seek_preview_hover:
+            self._schedule_seek_preview_hide()
 
     def _on_seek_press(self, e):
         self._seeking = True
@@ -2332,8 +2340,8 @@ class ComicViewer(tk.Tk):
 
     def _on_seek_release(self, e):
         self._seeking = False
-        if not self._seek_hovering:
-            self._hide_seek_preview()
+        if not self._seek_hovering and not self._seek_preview_hover:
+            self._schedule_seek_preview_hide()
 
     def _video_length(self):
         try:
@@ -2364,6 +2372,11 @@ class ComicViewer(tk.Tk):
         if not (self.is_video and self.seek.winfo_ismapped()):
             return
         t, length, photo = self._seek_preview_from_x(x)
+        self._seek_preview_time = t
+        self._seek_preview_x = x
+        if self._seek_hide_after:
+            self.after_cancel(self._seek_hide_after)
+            self._seek_hide_after = None
         text = "%s / %s" % (self._fmt_time(t), self._fmt_time(length))
         if photo is not None:
             self.seek_preview_label.configure(image=photo, text=text)
@@ -2379,12 +2392,58 @@ class ComicViewer(tk.Tk):
         self.update_idletasks()
         w = self.seek_preview_win.winfo_reqwidth()
         h = self.seek_preview_win.winfo_reqheight()
-        x = self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)
+        anchor_x = self.seek.winfo_rootx() + getattr(self, "_seek_preview_x", self.seek.winfo_width() // 2)
+        x = anchor_x - w // 2
+        left = self.winfo_rootx()
+        right = left + max(self.winfo_width(), 1) - w
+        x = max(left, min(x, right))
         y = self.winfo_rooty() + max(0, self.winfo_height() - h - 150)
         self.seek_preview_win.geometry("+%d+%d" % (x, y))
 
     def _hide_seek_preview(self):
+        if self._seek_hide_after:
+            self.after_cancel(self._seek_hide_after)
+            self._seek_hide_after = None
         self.seek_preview_win.withdraw()
+
+    def _schedule_seek_preview_hide(self):
+        if self._seek_hide_after:
+            self.after_cancel(self._seek_hide_after)
+        self._seek_hide_after = self.after(260, self._hide_seek_preview)
+
+    def _on_seek_preview_enter(self, e):
+        self._seek_preview_hover = True
+        if self._seek_hide_after:
+            self.after_cancel(self._seek_hide_after)
+            self._seek_hide_after = None
+
+    def _on_seek_preview_leave(self, e):
+        self._seek_preview_hover = False
+        if not self._seeking:
+            self._schedule_seek_preview_hide()
+
+    def _on_seek_preview_click(self, e):
+        self._seek_to_time(self._seek_preview_time)
+        self._hide_seek_preview()
+
+    def _seek_to_time(self, t):
+        if self._cast_mode == "dlna":
+            if self._dlna:
+                try:
+                    self._dlna_pos = t
+                    self._dlna.seek(t)
+                except Exception:
+                    pass
+            return
+        if not self.player or not self.is_video or self._video_is_stopping():
+            return
+        try:
+            self.player.set_time(int(t))
+            if self._captioner is not None:
+                self._captioner.reset()
+            self._last_seek = time.time()
+        except Exception:
+            pass
 
     # ---------------- 预生成进度缩略图（第二播放器离屏截图，不打断播放） ----------------
     def _start_seek_thumbs(self, src, path):
