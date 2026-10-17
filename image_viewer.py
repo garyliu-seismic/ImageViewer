@@ -280,11 +280,16 @@ class ComicViewer(tk.Tk):
         self._autohide_hidden = False         # 底部控制条当前是否被自动隐藏（视频铺满窗口）
         self._ov_top = None                   # 浮动顶部菜单覆盖层（Toplevel，参考 ACG Player）
         self._ov_reposition_after = None      # 覆盖层重新定位的去抖 after id
-        self._seek_preview_win = None         # 进度拖动时的画面预览小窗
+        self._seek_preview_win = None         # 进度条悬停/拖动时的画面预览小窗
         self._seek_preview_label = None
-        self._seek_preview_after = None       # 截帧节流/延迟 after id
         self._seeking = False                 # 是否正在拖动进度条
-        self._seek_preview_last = 0.0         # 上次截帧时间戳
+        self._seek_hovering = False           # 鼠标是否悬停在进度条上
+        self._seek_thumbs = []                # [(time_ms, PhotoImage)] 预生成缩略图
+        self._seek_thumbs_src = None          # 缩略图对应的视频 src
+        self._seek_thumbs_busy = False
+        self._thumb_player = None             # 用于生成缩略图的第二播放器（离屏）
+        self._thumb_state = None
+        self._thumb_gen_after = None
         self._thumb_photos = []
         self._thumb_rects = []
 
@@ -487,14 +492,21 @@ class ComicViewer(tk.Tk):
         self.caption_label.pack()
         self.video_panel.bind("<Configure>", lambda e: self._reposition_caption_window())
 
-        # 拖动进度条时的画面预览小窗（Toplevel，截图 / 时间文本，拖动时临时显示）
+        # 离屏渲染窗口：第二播放器在这里截图生成进度缩略图（不显示）
+        self._thumb_win = tk.Toplevel(self)
+        self._thumb_win.overrideredirect(True)
+        self._thumb_win.geometry("200x120+9000+9000")
+        self._thumb_frame = tk.Frame(self._thumb_win, bg="black", width=200, height=120)
+        self._thumb_frame.pack()
+
+        # 进度条悬停时的画面预览小窗（缩略图 + 时间）
         self.seek_preview_win = tk.Toplevel(self)
         self.seek_preview_win.overrideredirect(True)
         self.seek_preview_win.attributes("-topmost", True)
         self.seek_preview_win.withdraw()
         self.seek_preview_win.configure(bg="#000000")
         self.seek_preview_label = tk.Label(self.seek_preview_win, bg="#000000", fg="#ffffff",
-                                           font=("Consolas", 12), padx=10, pady=8)
+                                           font=("Consolas", 12), padx=8, pady=6, compound="bottom")
         self.seek_preview_label.pack()
 
         self._sync_toggle_buttons()
@@ -662,6 +674,9 @@ class ComicViewer(tk.Tk):
         self.video_panel.bind("<ButtonPress-1>", self._on_video_press)
         self.video_panel.bind("<B1-Motion>", self._on_video_motion)
         self.video_panel.bind("<ButtonRelease-1>", self._on_video_release)
+        self.seek.bind("<Enter>", self._on_seek_enter)
+        self.seek.bind("<Motion>", self._on_seek_hover)
+        self.seek.bind("<Leave>", self._on_seek_leave)
         self.seek.bind("<ButtonPress-1>", self._on_seek_press)
         self.seek.bind("<ButtonRelease-1>", self._on_seek_release)
 
@@ -1213,6 +1228,7 @@ class ComicViewer(tk.Tk):
             return
         self._show_video_bar()
         self._start_autohide()
+        self._start_seek_thumbs(src, path)
         self._update_status()
         self._update_video_time_loop()
 
@@ -1963,6 +1979,7 @@ class ComicViewer(tk.Tk):
             self._video_timer = None
         self._seeking = False
         self._hide_seek_preview()
+        self._cancel_seek_thumbs()
         if self._cast_mode == "dlna":
             # DLNA 投屏模式：保存投影仪位置，停 DLNA，不碰 VLC
             self._save_dlna_position()
@@ -2283,8 +2300,6 @@ class ComicViewer(tk.Tk):
                     self._dlna.seek(target)
                 except Exception:
                     pass
-            if self._seeking:
-                self._update_seek_preview_text()   # DLNA 无本地画面，只显示时间
             return
         if not self.player or not self.is_video or self._video_is_stopping():
             return
@@ -2296,34 +2311,66 @@ class ComicViewer(tk.Tk):
                     self._captioner.reset()
         except Exception:
             pass
-        if self._seeking:
-            self._update_seek_preview_text()
-            if time.time() - self._seek_preview_last > 0.35:
-                self._seek_preview_last = time.time()
-                self._schedule_seek_snapshot()
+
+    # ---------------- 进度条悬停预览（参考 ACG Player） ----------------
+    def _on_seek_enter(self, e):
+        self._seek_hovering = True
+        self._show_seek_preview_at(e.x)
+
+    def _on_seek_hover(self, e):
+        self._seek_hovering = True
+        self._show_seek_preview_at(e.x)
+
+    def _on_seek_leave(self, e):
+        self._seek_hovering = False
+        if not self._seeking:
+            self._hide_seek_preview()
 
     def _on_seek_press(self, e):
         self._seeking = True
+        self._show_seek_preview_at(e.x)
 
     def _on_seek_release(self, e):
         self._seeking = False
-        self._hide_seek_preview()
+        if not self._seek_hovering:
+            self._hide_seek_preview()
 
-    def _seek_cur_length(self):
+    def _video_length(self):
         try:
             if self._cast_mode == "dlna":
-                return self._dlna_pos, self._dlna_total
+                return self._dlna_total
             if self.player and not self._video_is_stopping():
-                return self.player.get_time(), self.player.get_length()
+                return self.player.get_length()
         except Exception:
             pass
-        return 0, 0
+        return 0
 
-    def _update_seek_preview_text(self):
-        cur, length = self._seek_cur_length()
-        self.seek_preview_label.configure(image="", text="%s / %s" % (
-            self._fmt_time(cur), self._fmt_time(length)))
-        self.seek_preview_label.image = None
+    def _seek_preview_from_x(self, x):
+        w = max(self.seek.winfo_width(), 1)
+        frac = clamp(x / w, 0.0, 1.0)
+        length = self._video_length()
+        t = int(frac * length) if length > 0 else 0
+        return t, length, self._nearest_seek_thumb(t)
+
+    def _nearest_seek_thumb(self, t):
+        best, best_d = None, None
+        for pos, photo in self._seek_thumbs:
+            d = abs(pos - t)
+            if best_d is None or d < best_d:
+                best_d, best = d, photo
+        return best
+
+    def _show_seek_preview_at(self, x):
+        if not (self.is_video and self.seek.winfo_ismapped()):
+            return
+        t, length, photo = self._seek_preview_from_x(x)
+        text = "%s / %s" % (self._fmt_time(t), self._fmt_time(length))
+        if photo is not None:
+            self.seek_preview_label.configure(image=photo, text=text)
+            self.seek_preview_label.image = photo
+        else:
+            self.seek_preview_label.configure(image="", text=text)
+            self.seek_preview_label.image = None
         self._position_seek_preview()
         self.seek_preview_win.deiconify()
         self.seek_preview_win.lift()
@@ -2337,47 +2384,110 @@ class ComicViewer(tk.Tk):
         self.seek_preview_win.geometry("+%d+%d" % (x, y))
 
     def _hide_seek_preview(self):
-        if self._seek_preview_after:
-            self.after_cancel(self._seek_preview_after)
-            self._seek_preview_after = None
         self.seek_preview_win.withdraw()
 
-    def _schedule_seek_snapshot(self):
-        if self._seek_preview_after:
+    # ---------------- 预生成进度缩略图（第二播放器离屏截图，不打断播放） ----------------
+    def _start_seek_thumbs(self, src, path):
+        self._cancel_seek_thumbs()
+        if not self.is_video or self._cast_mode == "dlna":
             return
-        self._seek_preview_after = self.after(250, self._take_seek_snapshot)
-
-    def _take_seek_snapshot(self):
-        self._seek_preview_after = None
-        if not self._seeking or self._cast_mode == "dlna":
+        if self._seek_thumbs_src == src and self._seek_thumbs:
             return
-        if not self.player or not self.is_video or self._video_is_stopping():
-            return
-        path = os.path.join(self._tmp_dir, "seek_preview.png")
+        self._seek_thumbs_src = src
+        self._seek_thumbs = []
+        self._seek_thumbs_busy = True
         try:
-            if self.player.video_take_snapshot(0, path, 320, 180) != 0:
-                return
+            tp = self.vlc_instance.media_player_new()
+            media = self.vlc_instance.media_new(path)
+            tp.set_media(media)
+            self.update_idletasks()
+            tp.set_hwnd(self._thumb_frame.winfo_id())
+            tp.play()
+            tp.audio_set_mute(True)
+            tp.set_pause(1)   # 暂停后 seek，画面停在目标帧，截图更准确
         except Exception:
+            self._seek_thumbs_busy = False
             return
-        self.after(150, self._show_seek_snapshot, path, 0)
+        self._thumb_player = tp
+        self._thumb_state = {"idx": 0, "total": 12, "waits": 0}
+        self._thumb_gen_after = self.after(400, self._seek_thumb_step)
 
-    def _show_seek_snapshot(self, path, attempt):
-        if not self._seeking:
+    def _cancel_seek_thumbs(self):
+        if self._thumb_gen_after:
+            self.after_cancel(self._thumb_gen_after)
+            self._thumb_gen_after = None
+        self._seek_thumbs_busy = False
+        tp, self._thumb_player = self._thumb_player, None
+        self._thumb_state = None
+        if tp is not None:
+            try:
+                tp.stop()
+                tp.release()
+            except Exception:
+                pass
+
+    def _seek_thumb_step(self):
+        self._thumb_gen_after = None
+        tp = self._thumb_player
+        st = self._thumb_state
+        if tp is None or st is None or not self.is_video:
+            self._cancel_seek_thumbs()
+            return
+        if self.sources and self._seek_thumbs_src != self.sources[self.index]:
+            self._cancel_seek_thumbs()
             return
         try:
-            if not os.path.exists(path) or os.path.getsize(path) == 0:
-                if attempt < 8:
-                    self.after(120, self._show_seek_snapshot, path, attempt + 1)
+            length = tp.get_length()
+        except Exception:
+            length = -1
+        if length <= 0:
+            st["waits"] += 1
+            if st["waits"] > 24:
+                self._cancel_seek_thumbs()
                 return
-            img = Image.open(path)
-            photo = ImageTk.PhotoImage(img)
-            self.seek_preview_label.configure(image=photo, text="")
-            self.seek_preview_label.image = photo
-            self._position_seek_preview()
-            self.seek_preview_win.deiconify()
-            self.seek_preview_win.lift()
+            self._thumb_gen_after = self.after(300, self._seek_thumb_step)
+            return
+        st["waits"] = 0
+        idx = st["idx"]
+        if idx >= st["total"]:
+            self._cancel_seek_thumbs()
+            return
+        pos = int(length * idx / st["total"])
+        try:
+            tp.set_time(pos)
         except Exception:
             pass
+        self._thumb_gen_after = self.after(220, self._seek_thumb_snap, idx, pos)
+
+    def _seek_thumb_snap(self, idx, pos):
+        self._thumb_gen_after = None
+        tp = self._thumb_player
+        if tp is None or not self.is_video:
+            self._cancel_seek_thumbs()
+            return
+        p = os.path.join(self._tmp_dir, "seek_thumb_%d.png" % idx)
+        ok = False
+        try:
+            ok = tp.video_take_snapshot(0, p, 240, 135) == 0
+        except Exception:
+            ok = False
+        if ok:
+            self._thumb_gen_after = self.after(60, self._seek_thumb_load, idx, pos, p)
+        else:
+            self._thumb_state["idx"] = idx + 1
+            self._thumb_gen_after = self.after(80, self._seek_thumb_step)
+
+    def _seek_thumb_load(self, idx, pos, p):
+        self._thumb_gen_after = None
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                img = Image.open(p)
+                self._seek_thumbs.append((pos, ImageTk.PhotoImage(img)))
+        except Exception:
+            pass
+        if self._thumb_state is not None:
+            self._thumb_state["idx"] = idx + 1
+        self._thumb_gen_after = self.after(80, self._seek_thumb_step)
 
     def _on_volume(self, val):
         if self._cast_mode == "dlna":
