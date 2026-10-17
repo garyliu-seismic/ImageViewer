@@ -1234,6 +1234,9 @@ class ComicViewer(tk.Tk):
             self.player.play()
             self._apply_rate_now()
             self.player.audio_set_volume(int(self.vol.get()))
+            # Windows 按 exe 记住进程音频会话的静音状态；旧版本（缩略图播放器
+            # audio_set_mute）留下的静音会一直保留，这里每次播放主动解除。
+            self.player.audio_set_mute(False)
             self.is_video = True
             self._apply_region_zoom()   # 清掉上一段视频残留的裁剪框，再按 zoom/区域放大应用
             self._apply_video_adjust()
