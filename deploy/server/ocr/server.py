@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PyReader / ImageViewer OCR proxy (POST /ocr/v1/page).
 
-Stdlib ThreadingHTTPServer on 127.0.0.1:8091. Receives one base64 JPEG page image, forwards it to
+Stdlib ThreadingHTTPServer on 127.0.0.1:8092. Receives one base64 JPEG page image, forwards it to
 DashScope (OpenAI-compatible chat/completions, vision model) with a FIXED server-side prompt, and returns
 the transcribed text. Same auth style as the TTS proxy (Bearer token -> sha256 -> user table).
 
@@ -68,7 +68,7 @@ class Config:
     def __init__(self, **kw):
         e = os.environ.get
         self.host = e("OCR_HOST", "127.0.0.1")
-        self.port = int(e("OCR_PORT", "8091"))
+        self.port = int(e("OCR_PORT", "8092"))
         self.data_dir = e("OCR_DATA_DIR", "/var/lib/pyreader-ocr")
         self.cache_dir = e("OCR_CACHE_DIR", "/var/cache/pyreader-ocr")
         self.tokens_file = e("OCR_TOKENS_FILE", "/etc/pyreader-ocr/tokens.json")
