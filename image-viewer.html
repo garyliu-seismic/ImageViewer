@@ -941,6 +941,8 @@
       <button class="btn" id="browseUp">上一级</button>
       <button class="btn" id="browseCloud" title="浏览后端已配置的 WebDAV 云端（目前可播放里面的视频）">☁ 云端</button>
       <button class="btn icon" id="browseCloudCfg" title="云端账号设置（WebDAV）">⚙</button>
+      <button class="btn" id="browseJf" title="浏览并播放局域网 Jellyfin / Emby 媒体库（海报、简介、字幕直接用 Jellyfin 自己的）">🎬 Jellyfin</button>
+      <button class="btn icon" id="browseJfCfg" title="Jellyfin 账号设置">⚙</button>
     </div>
     <div id="browseRecent"></div>
     <div class="brow-view" id="browseView">
@@ -1060,6 +1062,10 @@
       <select id="vpSubSel"><option value="-1">无字幕</option></select>
     </label>
     <button class="btn" id="vpSubLoad" title="载入本地字幕 .srt / .vtt / .ass">＋ 载入字幕</button>
+    <button class="btn" id="vpSubAi" title="用 faster-whisper 在本机识别音频生成字幕（需要后端 + ffmpeg + 模型；长视频要等几分钟，生成后会缓存）" hidden>✨ AI 字幕</button>
+    <select id="vpSubAiLang" title="音频语言" hidden>
+      <option value="ja">日语</option><option value="en">英语</option><option value="zh">中文</option><option value="ko">韩语</option>
+    </select>
     <button class="btn" id="vpSubSize" title="字幕大小（点一下切换）">字幕 A</button>
   </div>
 </div>
@@ -1068,12 +1074,12 @@
 <div id="rcloud" class="modal hidden">
   <div class="modal-card" style="max-width:460px">
     <button class="modal-close" data-close="rcloud">✕</button>
-    <h2>云端账号（WebDAV）</h2>
-    <p class="dav-note">连接 AList / 坚果云 / NAS 等的 WebDAV，然后在「☁ 云端」里浏览并播放里面的视频。
+    <h2 id="rcTitle">云端账号（WebDAV）</h2>
+    <p class="dav-note" id="rcNote">连接 AList / 坚果云 / NAS 等的 WebDAV，然后在「☁ 云端」里浏览并播放里面的视频。
       账号只保存在运行后端的这台电脑上（与桌面版共用），不会发给浏览器；建议用<b>只读</b>账号。
       AList 的地址通常是 <code>http://主机:5244/dav</code>（<b>要带 /dav</b>）。</p>
     <div id="rcState"></div>
-    <label>WebDAV 地址<input type="text" id="rcUrl" autocomplete="off" spellcheck="false" placeholder="http://192.168.1.10:5244/dav" inputmode="url"></label>
+    <label><span id="rcUrlLab">WebDAV 地址</span><input type="text" id="rcUrl" autocomplete="off" spellcheck="false" placeholder="http://192.168.1.10:5244/dav" inputmode="url"></label>
     <label>用户名<input type="text" id="rcUser" autocomplete="username" spellcheck="false"></label>
     <label>密码<input type="password" id="rcPass" autocomplete="current-password"></label>
     <p id="rcMsg"></p>
@@ -4257,7 +4263,7 @@
     var tag = e.target && e.target.tagName;
     if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') {
       if (e.key === 'Enter' && !$('#jump').classList.contains('hidden')) { e.preventDefault(); doJump(); }
-      if (e.key === 'Escape') closeModals();
+      if (e.key === 'Escape') escModal();
       return;
     }
     /* 书架开着时，空格 / 方向键 / L 等不要去翻后面的书（Esc 照常关弹窗） */
@@ -4307,7 +4313,7 @@
       case 'End': if (pages.length) showPage(pages.length - 1); break;
       case '?': case 'h': case 'H': toggleModal('help'); break;
       case 'Escape':
-        if (anyModal()) closeModals();
+        if (anyModal()) escModal();
         else document.body.classList.remove('ui-hidden');
         break;
     }
@@ -4316,6 +4322,11 @@
   var MODALS = ['scrDetail', 'scrFix', 'help', 'jump', 'detail', 'browse', 'dav', 'shelf', 'bm', 'ttsSet', 'aiConsent', 'rcloud'];
   function anyModal() {
     return MODALS.some(function (id) { return !$('#' + id).classList.contains('hidden'); });
+  }
+  /* Esc：只关最上面一层（修正匹配 > 详情），其余弹窗照旧一起关；这样在海报墙里看详情时 Esc 回到海报墙，不是整个退出 */
+  function escModal() {
+    var top = ['scrFix', 'scrDetail'].filter(function (id) { return !$('#' + id).classList.contains('hidden'); })[0];
+    if (top) toggleModal(top, false); else closeModals();
   }
   function closeModals() { shelfSeq++; shelfOpenGen++; MODALS.forEach(function (id) { $('#' + id).classList.add('hidden'); }); if (davPending) davFinish(null); }
   function toggleModal(id, force) {
@@ -5085,7 +5096,7 @@
     var list = $('#browseList');
     list.innerHTML = '<div class="browse-empty">读取中…</div>';
     var req = browseRemote ? apiJson('/api/remote/ls', { path: path }).then(function (j) {
-      return { dir: j.path, entries: (j.entries || []).map(function (e) { return { rel: e.rel, name: e.name, kind: e.kind, path: e.path, size: e.size }; }) };
+      return { dir: j.path, parent: j.parent, entries: (j.entries || []).map(function (e) { return { rel: e.rel, name: e.name, kind: e.kind, path: e.path, size: e.size, subs: e.subs }; }) };
     }) : apiJson('/api/ls', { path: path, recursive: '0' });
     return req.then(function (j) {
       if (!browseRemote) browseLocalPath = j.dir;
@@ -5093,10 +5104,12 @@
       $('#browsePath').value = j.dir;
       var rows = [];
       var parent = C.topDir(j.dir.replace(/\\/g, '/').replace(/\/[^/]*$/, ''));
-      if (parent) rows.push({ rel: '..', name: '↑ 上一级', kind: 'up', path: j.dir.replace(/\\/g, '/').replace(/\/[^/]+$/, '') });
+      var upPath = j.dir.replace(/\\/g, '/').replace(/\/[^/]+$/, '');
+      if (j.parent !== undefined) { parent = j.parent; upPath = j.parent; }   /* 服务端给了上一级（Jellyfin 的 id 链）就以它为准 */
+      if (parent) rows.push({ rel: '..', name: '↑ 上一级', kind: 'up', path: upPath });
       (j.entries || []).forEach(function (e) {
         rows.push({ rel: e.rel, name: e.name, kind: e.kind, path: e.path,
-                    size: e.size, dir: e.kind === 'dir' });
+                    size: e.size, dir: e.kind === 'dir', subs: e.subs });
       });
       if (!rows.length) rows.push({ rel: '', name: '（空目录）', kind: 'empty' });
       list.innerHTML = rows.map(function (r, i) {
@@ -5109,6 +5122,7 @@
       }).join('');
       list._rows = rows;
       $('#browseInfo').textContent = (j.entries || []).length + ' 项';
+      syncCloudBtns();
       if (W.on) wallLoad();
       return rows;
     })['catch'](function (e) {
@@ -5345,6 +5359,8 @@
       return '<option value="' + i + '" title="' + esc(s.name) + '">' + esc(it && s.emb == null ? C.subLabel(it.name, s.name) : s.name) + '</option>';
     }).join('');
     sel.value = String(VP.subIdx);
+    var asrOk = !!(BE.on && BE.caps.asr && BE.caps.ffmpeg && BE.caps.ffmpeg.available);
+    $('#vpSubAi').hidden = !asrOk; $('#vpSubAiLang').hidden = !asrOk;
   }
   /** 把 WebVTT 文本挂成 <track>（Blob URL）；null = 关闭字幕 */
   function vpSubAttach(vtt, label) {
@@ -5391,12 +5407,56 @@
       var cur = VP.items[VP.i];
       return vpFetchSub(apiPath('/api/media/subtitle', Object.assign(vpWho(cur), { stream: s.emb, start: VP.tc ? VP.tc.offset : 0 }))).then(use, fail);
     }
+    if (s.asr) {                                           /* AI 字幕：后端缓存的 WebVTT（转码流按起点偏移对时） */
+      var cur2 = VP.items[VP.i];
+      return vpFetchSub(apiPath('/api/media/asr/vtt', Object.assign(vpWho(cur2), { lang: s.asr, start: VP.tc ? VP.tc.offset : 0 }))).then(use, fail);
+    }
     if (s.url) return vpFetchSub(s.url).then(use, fail);
     if (s.file) {
       if (s.file.size > C.SUB_MAX_BYTES) { fail(new Error('字幕文件太大（上限 ' + (C.SUB_MAX_BYTES / 1048576) + ' MB）')); return Promise.resolve(); }
       return s.file.arrayBuffer().then(use, fail);
     }
     return vpFetchSub(apiPath('/api/subtitle', { path: s.remote, name: s.name })).then(use, fail);
+  }
+  /** AI 字幕：POST 启动后台任务 -> 轮询进度 -> 完成后作为一条字幕挂上（后端有缓存，再点秒出） */
+  function vpSubAi() {
+    var it = VP.items[VP.i], seq = VP.seq, btn = $('#vpSubAi');
+    if (!BE.on || !it || !(it.path || it.remotePath) || btn.disabled) return;
+    var lang = $('#vpSubAiLang').value, who = vpWho(it), label = btn.textContent;
+    var langName = { ja: '日语', en: '英语', zh: '中文', ko: '韩语' }[lang] || lang;
+    btn.disabled = true;
+    function done() { btn.disabled = false; btn.textContent = label; }
+    var shown = 0, attached = false;
+    /* 后端边读边识别：识别中就能取到「目前为止」的字幕。第一批出来时自动挂上，之后每批刷新一次
+       （只刷新用户当前选着的这条；用户切到别的字幕就不打扰）。 */
+    function show(final) {
+      var name = 'AI 字幕（' + langName + '）.vtt';
+      var idx = -1;
+      VP.subs.forEach(function (s, i) { if (s.asr === lang) idx = i; });
+      if (idx < 0) { VP.subs.push({ name: name, asr: lang }); idx = VP.subs.length - 1; }
+      vpSubRefresh();
+      if (final || !attached) { attached = true; vpSubSelect(idx); }
+      else if (VP.subIdx === idx) vpSubSelect(idx, true);
+    }
+    function finish() { done(); show(true); }
+    function poll(st) {
+      if (seq !== VP.seq) { done(); return; }                       /* 已切到别的视频；后台任务照跑，结果有缓存 */
+      if (st.state === 'done') { finish(); return; }
+      if (st.state === 'error') {
+        done();
+        if (st.count) show(false);                                   /* 出错前已识别的部分仍可用 */
+        toast('AI 字幕失败：' + (st.error || '未知错误'));
+        return;
+      }
+      if (st.count && st.count > shown) { shown = st.count; show(false); }
+      btn.textContent = st.state === 'queued' ? '✨ 排队中…'
+        : '✨ 识别中 ' + (st.pct || 0) + '%' + (st.count ? '（已出 ' + st.count + ' 条）' : '');
+      setTimeout(function () {
+        apiJson('/api/media/asr', Object.assign({ lang: lang }, who)).then(poll, function (e) { done(); toast('AI 字幕失败：' + e.message); });
+      }, 2000);
+    }
+    btn.textContent = '✨ 启动中…';
+    apiJson('/api/media/asr', {}, 'POST', Object.assign({ lang: lang }, who)).then(poll, function (e) { done(); toast('AI 字幕失败：' + e.message); });
   }
   function vpSubAddFiles(files) {
     var added = -1;
@@ -5468,7 +5528,10 @@
       var stem = r.name.replace(/\.[^.]+$/, '').toLowerCase();
       return { name: r.name, url: apiPath('/api/remote/data', { path: r.path }), remotePath: r.path,
         subs: subRows.filter(function (s) { var b = s.name.replace(/\.[^.]+$/, '').toLowerCase(); return b === stem || b.indexOf(stem + '.') === 0; })
-          .map(function (s) { return { name: s.name, url: apiPath('/api/remote/data', { path: s.path }) }; }) };
+          .map(function (s) { return { name: s.name, url: apiPath('/api/remote/data', { path: s.path }) }; })
+          .concat((r.subs || []).map(function (s) {          /* Jellyfin 自己的字幕（内嵌 / 外挂），由服务器转成 WebVTT */
+            return { name: (s.name || ('字幕 ' + s.index)) + '.vtt', url: apiPath('/api/remote/jfsub', { path: r.path, index: s.index }) };
+          })) };
     });
     var idx = 0;
     items.forEach(function (it, k) { if (it.remotePath === path) idx = k; });
@@ -5603,7 +5666,7 @@
       VP.metaReady = false; vpLoadStop(); vpLoadStart('load');
       var pr = v.play(); if (pr && pr['catch']) pr['catch'](function () {});
       var sub = VP.subs[VP.subIdx];
-      if (sub && sub.emb != null) vpSubSelect(VP.subIdx, true);                /* 内嵌字幕按新起点重新对时 */
+      if (sub && (sub.emb != null || sub.asr)) vpSubSelect(VP.subIdx, true);             /* 内嵌字幕按新起点重新对时 */
       if (p.action === 'transcode_video' && !VP.heavyShown) { VP.heavyShown = true; toast('这个视频的画面编码（' + String(p.video.codec).toUpperCase() + '）浏览器解不了，正在实时转成 H.264：比较耗 CPU / 显卡，请耐心等待'); }
     };
     if (VP.probe) { go(VP.probe); return Promise.resolve(); }
@@ -5627,9 +5690,10 @@
     } else { var v = vpV(); v.currentTime = Math.max(0, Math.min(v.duration || 1e9, sec)); }
   }
   function vpOpenVlc() {
-    var it = VP.items[VP.i]; if (!it || !(it.path || it.remotePath)) return;
-    apiJson('/api/open-external', null, 'POST', vpWho(it)).then(function () { toast('已交给 VLC 打开（这里的播放可以关了）'); },
-      function (e) { toast('用 VLC 打开失败：' + ((e && e.message) || e)); });
+    var it = VP.items[VP.i];
+    if (!it || !(it.path || it.remotePath)) { toast('这个视频不是本机文件 / 云端文件（可能是上传或压缩包里的），没法交给 VLC', 5000); return; }
+    apiJson('/api/open-external', null, 'POST', vpWho(it)).then(function () { toast('已交给 VLC 打开（这里的播放可以关了）', 4000); },
+      function (e) { toast('用 VLC 打开失败：' + ((e && e.message) || e), 6000); });
   }
   (function wireFf() {
     var v = vpV();
@@ -5668,6 +5732,7 @@
     });
     $('#vpSubSel').addEventListener('change', function () { vpSubSelect(parseInt(this.value, 10)); });
     $('#vpSubLoad').addEventListener('click', function () { $('#vpSubInput').click(); });
+    $('#vpSubAi').addEventListener('click', function () { vpSubAi(); });
     $('#vpSubInput').addEventListener('change', function (e) { var fs = e.target.files; vpSubAddFiles(fs); e.target.value = ''; });
     $('#vpSubSize').addEventListener('click', function () {
       vpPrefs.cue = ((vpPrefs.cue == null ? 1 : vpPrefs.cue) + 1) % VP_CUE_SIZES.length; vpSavePrefs(); vpApplyCue();
@@ -6404,15 +6469,33 @@
   });
   $('#browseOpen').addEventListener('click', function () { browseOpenSel(); });
   /* 云端（后端 WebDAV）账号：后端 POST /api/remote/config 会先连一次自检，成功才保存；密码从不回显 */
+  /* 账号框两用：rcKind = 'dav'（WebDAV / AList）或 'jf'（Jellyfin / Emby；后端只存登录后的 token，不存密码） */
+  var rcKind = 'dav';
+  function rcApi(name) { return rcKind === 'jf' ? '/api/jellyfin/' + name : '/api/remote/' + name; }
+  function rcSetKind(kind) {
+    rcKind = kind;
+    var jf = kind === 'jf';
+    $('#rcTitle').textContent = jf ? 'Jellyfin / Emby 账号' : '云端账号（WebDAV）';
+    $('#rcUrlLab').textContent = jf ? 'Jellyfin 地址' : 'WebDAV 地址';
+    $('#rcUrl').placeholder = jf ? 'http://192.168.1.20:8096' : 'http://192.168.1.10:5244/dav';
+    $('#rcNote').innerHTML = jf
+      ? '连接局域网里的 Jellyfin / Emby，然后在「🎬 Jellyfin」里浏览片库并播放。海报、简介、评分和字幕直接用 Jellyfin 自己的（不查 TMDB）。' +
+        '登录成功后后端只保存 token（与桌面版共用），<b>不保存密码</b>。地址形如 <code>http://主机:8096</code>。'
+      : '连接 AList / 坚果云 / NAS 等的 WebDAV，然后在「☁ 云端」里浏览并播放里面的视频。' +
+        '账号只保存在运行后端的这台电脑上（与桌面版共用），不会发给浏览器；建议用<b>只读</b>账号。' +
+        'AList 的地址通常是 <code>http://主机:5244/dav</code>（<b>要带 /dav</b>）。';
+    $('#rcUrl').value = ''; $('#rcUser').value = ''; $('#rcPass').value = '';
+  }
   function rcRefresh() {
-    return apiJson('/api/remote/config').then(function (c) {
+    return apiJson(rcApi('config')).then(function (c) {
       $('#rcState').textContent = c.connected ? '已连接：' + c.base_url + (c.username ? '（' + c.username + '）' : '') : '尚未连接';
       $('#rcDisconnect').disabled = !c.connected;
       if (c.connected) { $('#rcUrl').value = c.base_url; $('#rcUser').value = c.username || ''; }
       return c;
     });
   }
-  function openRcloud(msg) {
+  function openRcloud(msg, kind) {
+    rcSetKind(kind || 'dav');
     $('#rcMsg').textContent = msg || ''; $('#rcPass').value = '';
     toggleModal('rcloud', true);
     rcRefresh()['catch'](function (e) { $('#rcMsg').textContent = '读取配置失败：' + ((e && e.message) || e); });
@@ -6423,7 +6506,7 @@
     return browseTo('');
   }
   function leaveCloud() {
-    browseRemote = false; $('#browseCloud').classList.remove('on');
+    browseRemote = false; $('#browseCloud').classList.remove('on'); $('#browseJf').classList.remove('on');
     return browseTo(browseLocalPath || $('#browsePath').value || '');
   }
   $('#browseCloud').addEventListener('click', function () {
@@ -6433,10 +6516,29 @@
       enterCloud();
     })['catch'](function (e) { toast('读取云端配置失败：' + ((e && e.message) || e)); });
   });
-  $('#browseCloudCfg').addEventListener('click', function () { openRcloud(''); });
+  $('#browseCloudCfg').addEventListener('click', function () { openRcloud('', 'dav'); });
+  /* Jellyfin：虚拟根路径 /jf（目录 = /jf/<id>/<id>…，后端按前缀分流到 Jellyfin） */
+  function inJf() { return browseRemote && /^\/jf(\/|$)/.test(browsePath); }
+  function syncCloudBtns() {
+    var jf = inJf();
+    $('#browseCloud').classList.toggle('on', browseRemote && !jf);
+    $('#browseJf').classList.toggle('on', jf);
+  }
+  function enterJf() {
+    browseRemote = true;
+    return browseTo('/jf');
+  }
+  $('#browseJf').addEventListener('click', function () {
+    if (inJf()) { leaveCloud(); return; }
+    apiJson('/api/jellyfin/config').then(function (c) {
+      if (!c.connected) { openRcloud('先填 Jellyfin 地址和账号（局域网地址，形如 http://192.168.1.20:8096）', 'jf'); return; }
+      enterJf();
+    })['catch'](function (e) { toast('读取 Jellyfin 配置失败：' + ((e && e.message) || e)); });
+  });
+  $('#browseJfCfg').addEventListener('click', function () { openRcloud('', 'jf'); });
   $('#rcConnect').addEventListener('click', function () {
     var url = $('#rcUrl').value.trim(), btn = this;
-    if (!url) { $('#rcMsg').textContent = '请填 WebDAV 地址'; return; }
+    if (!url) { $('#rcMsg').textContent = rcKind === 'jf' ? '请填 Jellyfin 地址' : '请填 WebDAV 地址'; return; }
     if (!/^https?:\/\//i.test(url)) url = 'http://' + url;
     var risk = C.plainHttpRisk(url);
     if (risk.warn && rcArmed !== url) {                  /* 明文 HTTP + 公网地址：要二次确认 */
@@ -6447,14 +6549,17 @@
       return;
     }
     btn.disabled = true; $('#rcMsg').textContent = '正在连接…';
-    apiJson('/api/remote/config', null, 'POST', { base_url: url, username: $('#rcUser').value.trim(), password: $('#rcPass').value }).then(function () {
+    var kindNow = rcKind;
+    apiJson(rcApi('config'), null, 'POST', { base_url: url, username: $('#rcUser').value.trim(), password: $('#rcPass').value }).then(function () {
       $('#rcPass').value = '';
       toggleModal('rcloud', false);
-      toast('云端已连接');
-      if (!$('#browse').classList.contains('hidden')) return enterCloud();
+      toast(kindNow === 'jf' ? 'Jellyfin 已连接' : '云端已连接');
+      if (!$('#browse').classList.contains('hidden')) return kindNow === 'jf' ? enterJf() : enterCloud();
     }, function (e) {
       var m = String((e && e.message) || e);
-      var hint = /404|Not Found/i.test(m) ? '（地址对吗？AList 要带 /dav，例如 http://主机:5244/dav）'
+      var hint = kindNow === 'jf'
+        ? (/401|Unauthorized/i.test(m) ? '（用户名或密码不对？）' : /404|Not Found/i.test(m) ? '（地址对吗？形如 http://主机:8096，不要带 /web）' : '')
+        : /404|Not Found/i.test(m) ? '（地址对吗？AList 要带 /dav，例如 http://主机:5244/dav）'
         : /401|Unauthorized/i.test(m) ? '（用户名或密码不对？AList 需要在「用户」里开启 WebDAV 读取权限）' : '';
       $('#rcMsg').textContent = '连接失败：' + m + hint;
     }).then(function () { btn.disabled = false; rcArmed = ''; btn.textContent = '连接'; });
@@ -6463,9 +6568,10 @@
   $('#rcUrl').addEventListener('input', function () { rcArmed = ''; $('#rcConnect').textContent = '连接'; });
   $('#rcPass').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); $('#rcConnect').click(); } });
   $('#rcDisconnect').addEventListener('click', function () {
-    apiJson('/api/remote/disconnect', null, 'POST', {}).then(function () {
+    var wasJf = rcKind === 'jf';
+    apiJson(rcApi('disconnect'), null, 'POST', {}).then(function () {
       $('#rcUrl').value = ''; $('#rcUser').value = ''; $('#rcPass').value = '';
-      toggleModal('rcloud', false); toast('已断开并删除云端账号');
+      toggleModal('rcloud', false); toast(wasJf ? '已断开并删除 Jellyfin 账号' : '已断开并删除云端账号');
       if (browseRemote) leaveCloud();
     }, function (e) { $('#rcMsg').textContent = '断开失败：' + ((e && e.message) || e); });
   });
@@ -6529,7 +6635,8 @@
   }
   function wallRestore(ret) {
     browseRemote = !!ret.remote;
-    $('#browseCloud').classList.toggle('on', browseRemote);
+    $('#browseCloud').classList.toggle('on', browseRemote && !/^\/jf(\/|$)/.test(ret.path || ''));
+    $('#browseJf').classList.toggle('on', browseRemote && /^\/jf(\/|$)/.test(ret.path || ''));
     W.sub = ret.sub !== false;
     W.on = !!ret.wall;
     $('#browse').classList.toggle('wall-on', W.on);
@@ -6597,7 +6704,7 @@
       calls++;
       var req = W.remote ? apiJson('/api/remote/ls', { path: d.path }) : apiJson('/api/ls', { path: d.path, recursive: '0' });
       return req.then(function (j) {
-        var es = (j.entries || []).map(function (e) { return { rel: e.rel, name: e.name, kind: e.kind, path: e.path, size: e.size, dir: e.kind === 'dir' }; });
+        var es = (j.entries || []).map(function (e) { return { rel: e.rel, name: e.name, kind: e.kind, path: e.path, size: e.size, dir: e.kind === 'dir', subs: e.subs }; });
         W.dirRows[d.path] = es;
         return es;
       }, function () { return []; });
