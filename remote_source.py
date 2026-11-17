@@ -286,11 +286,14 @@ class JellyfinProvider(RemoteProvider):
         except Exception:
             return []
 
-    def list_dir_strict(self, path):
-        """同 list_dir，但网络/认证错误直接抛出，供连接自检与界面显示真实原因。"""
+    def list_dir_strict(self, path, fields=None, raw=False):
+        """同 list_dir，但网络/认证错误直接抛出，供连接自检与界面显示真实原因。
+
+        fields：额外要的 Jellyfin Fields（逗号串，网页版要 MediaStreams 等）；
+        raw=True 时把原始 item JSON 放进 extra["raw"]（桌面版不传，行为不变）。"""
         path = path or ""
         url = self.base_url + "/Users/%s/Items" % self.user_id
-        params = {"Recursive": "false", "Fields": "Overview,ProductionYear"}
+        params = {"Recursive": "false", "Fields": "Overview,ProductionYear" + ("," + fields if fields else "")}
         if path:
             params["ParentId"] = path
         url += "?" + urllib.parse.urlencode(params)
@@ -306,6 +309,8 @@ class JellyfinProvider(RemoteProvider):
                 "year": it.get("ProductionYear"),
                 "overview": it.get("Overview"),
             }
+            if raw:
+                extra["raw"] = it
             if itype in self.FOLDER_TYPES or it.get("IsFolder"):
                 entries.append(RemoteSource(self.name, iid, name=name, is_dir=True,
                                             kind="folder", extra=extra))

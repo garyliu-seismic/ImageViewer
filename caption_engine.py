@@ -276,6 +276,10 @@ class _SenseVoiceASR:
             tokens=tokens, model=model, num_threads=num_threads,
             sample_rate=sample_rate, feature_dim=80,
             language=language, use_itn=True)
+        self._init_vad(vad_model, sample_rate, num_threads)
+
+    def _init_vad(self, vad_model, sample_rate, num_threads):
+        import sherpa_onnx
         vad_cfg = sherpa_onnx.VadModelConfig(
             silero_vad=sherpa_onnx.SileroVadModelConfig(
                 model=vad_model, threshold=0.5,
@@ -348,6 +352,37 @@ class _SenseVoiceASR:
         return (s.result.text or "").strip()
 
 
+class _FasterWhisperASR(_SenseVoiceASR):
+    """faster-whisper 后端（日语等）：沿用 SenseVoice 的 VAD 分句 + 滚动半成品窗口，
+    只把「转写一段音频」换成 Whisper（GPU float16，无 CUDA 则 CPU int8）。
+
+    半成品每秒转写一次对 GPU 无压力；CPU 上请把 PARTIAL_EVERY_SEC 调大或用 small 模型。"""
+
+    # Whisper 对短于 ~0.5s 的片段容易幻觉，丢弃
+    MIN_SEC = 0.5
+
+    def __init__(self, vad_model, sample_rate, num_threads, language="ja"):
+        import whisper_engine
+        self._lang = language
+        whisper_engine.get_model()  # 预加载（本方法跑在后台加载线程里）
+        self._init_vad(vad_model, sample_rate, num_threads)
+
+    def _transcribe(self, samples):
+        import whisper_engine
+        if len(samples) < int(self._sample_rate * self.MIN_SEC):
+            return ""
+        try:
+            segs = whisper_engine.transcribe(samples, language=self._lang)
+        except Exception:
+            return ""
+        return "".join(t for _a, _b, t in segs).strip()
+
+
+def _ja_backend():
+    """日语识别后端：环境变量 IV_ASR_JA=whisper|sensevoice（默认 sensevoice）。"""
+    return (os.environ.get("IV_ASR_JA") or "sensevoice").lower()
+
+
 class LiveCaptioner:
     def __init__(self, source_lang="en", caption_mode="original", model_path=None, ai_cfg=None):
         self.source_lang = source_lang
@@ -388,6 +423,9 @@ class LiveCaptioner:
     def available(self):
         if self.source_lang == "zh":
             return all(os.path.isfile(p) for p in _sherpa_zh_paths().values())
+        if self.source_lang == "ja" and _ja_backend() == "whisper":
+            import whisper_engine
+            return whisper_engine.available() and os.path.isfile(_silero_vad_path())
         if self.source_lang in ("ja", "ko", "yue"):
             p = _sensevoice_paths()
             return (os.path.isfile(p["tokens"]) and os.path.isfile(p["model"])
@@ -402,6 +440,9 @@ class LiveCaptioner:
                     paths["tokens"], paths["encoder"], paths["decoder"], paths["joiner"],
                     SAMPLE_RATE, SHERPA_ZH_NUM_THREADS,
                     punct_model=_sherpa_punct_path(), punct_threads=PUNCT_ZH_NUM_THREADS)
+            elif self.source_lang == "ja" and _ja_backend() == "whisper":
+                self._asr = _FasterWhisperASR(
+                    _silero_vad_path(), SAMPLE_RATE, SENSEVOICE_NUM_THREADS, language="ja")
             elif self.source_lang in ("ja", "ko", "yue"):
                 paths = _sensevoice_paths()
                 self._asr = _SenseVoiceASR(

@@ -30,6 +30,7 @@ import sys
 import tempfile
 import threading
 import urllib.parse
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -471,6 +472,14 @@ def remote_resume_key(remote_path):
     rp = str(remote_path or "")
     if not rp or len(rp) > REMOTE_PATH_MAX or any(ord(c) < 32 for c in rp):
         raise ValueError("云端路径不合法")
+    if is_jf_path(rp):                                   # Jellyfin：jf:<host:port>/<item id>
+        jb = jf_config().get("base_url") or ""
+        if not jb:
+            raise RuntimeError("还没连接 Jellyfin")
+        if ext_of(rp) not in VIDEO_EXTS:
+            raise PermissionError("不允许读取该文件")
+        jh = up.urlsplit(jb if "://" in jb else "http://" + jb).netloc.rpartition("@")[2].lower()
+        return "jf:%s/%s" % (jh, jf_item_id(rp))
     cfg = remote_config()
     base = cfg.get("base_url") or ""
     if not base:
@@ -535,15 +544,36 @@ _scrape = {}
 SCRAPE_SCAN_MAX = 2000
 
 
+def tmdb_token_file():
+    """令牌文件：IV_TMDB_TOKEN_FILE 或 %APPDATA%/ImageViewer/tmdb_token（非 Windows 用 ~/.config/ImageViewer/tmdb_token）。"""
+    p = os.environ.get("IV_TMDB_TOKEN_FILE")
+    if p:
+        return p
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "ImageViewer", "tmdb_token")
+
+
+def read_tmdb_token():
+    """每次请求时读：优先环境变量 TMDB_TOKEN，其次令牌文件（文件内容 = 令牌，首行有效）。不缓存、不下发浏览器。"""
+    t = (os.environ.get("TMDB_TOKEN") or "").strip()
+    if t:
+        return t
+    try:
+        with open(tmdb_token_file(), "r", encoding="utf-8-sig") as f:
+            return (f.readline() or "").strip()
+    except OSError:
+        return ""
+
+
 def get_scraper():
     """惰性创建。缓存目录 = IV_SCRAPE_DIR 或 <配置文件目录>/scrape_cache（绝不写进媒体目录）。
-    令牌只在每次请求时从环境变量 TMDB_TOKEN 读，不保存、不下发。"""
+    令牌每次请求时由 read_tmdb_token() 读（环境变量或令牌文件），不下发。"""
     sc = _scrape.get("s")
     if sc is None:
         import scrape
         d = os.environ.get("IV_SCRAPE_DIR") or os.path.join(os.path.dirname(os.path.abspath(CONFIG_PATH)), "scrape_cache")
         os.makedirs(d, exist_ok=True)
-        sc = _scrape["s"] = scrape.Scraper(d, scrape.TmdbClient(lambda: os.environ.get("TMDB_TOKEN", "")))
+        sc = _scrape["s"] = scrape.Scraper(d, scrape.TmdbClient(read_tmdb_token))
         try:
             sc.purge()                       # 启动时顺手清过期（TMDB 条款：缓存不超过 6 个月）
         except Exception:
@@ -683,7 +713,16 @@ def capabilities():
         "video_exts": sorted(BROWSER_VIDEO_EXTS),
         "ffmpeg": ffmpeg_tools.info(),
         "vlc": bool(os.name == "nt" and ffmpeg_tools.find_vlc()),
+        "asr": _asr_available(),
     }
+
+
+def _asr_available():
+    try:
+        import whisper_engine
+        return bool(whisper_engine.available())
+    except Exception:
+        return False
 
 
 # ----------------------------- 本地上传（给 file:// 选中的文件兼个落盘点）-----------------------------
@@ -755,6 +794,8 @@ def get_webdav(rebuild=False):
 
 
 def remote_list(path):
+    if is_jf_path(path or ""):
+        return jf_list(path)
     p = get_webdav()
     if p is None:
         raise RuntimeError("还没配置 WebDAV（在网页版里点「☁ WebDAV」填写）")
@@ -768,6 +809,8 @@ def remote_list(path):
 
 def remote_open(path, headers=None):
     """返回 (上游 response, 是否需要关闭)。"""
+    if is_jf_path(path):
+        return jf_open(path, headers)
     p = get_webdav()
     if p is None:
         raise RuntimeError("还没配置 WebDAV")
@@ -817,6 +860,219 @@ def remote_local(path, mtime=None, size=None):
         with open(dest, "wb") as f:
             f.write(data)
     return dest.replace("\\", "/")
+
+
+# ----------------------------- Jellyfin / Emby（局域网媒体库）-----------------------------
+# 把 Jellyfin 条目映射成「虚拟云端路径」，这样现有的云端浏览 / 播放 / 转码 / AI 字幕 / 续播
+# 全部原样复用（它们只认 remote 路径）：
+#   /jf                      根（媒体库列表）
+#   /jf/<id>/<id>            目录（祖先 id 链，所以前端「上一级」= 去掉最后一段）
+#   /jf/<id>/<itemId>.mkv    视频（末段 = item id + 容器扩展名，扩展名只为过现有的视频白名单）
+# 账号存在 _jellyfin_ 段（和桌面版同一份：只存 token，不存密码）。
+JF_ROOT = "/jf"
+_jf_meta = {}               # item id -> 元数据（ls 时顺手缓存，海报墙 peek 用，不必逐条再问服务器）
+_JF_META_MAX = 4000
+_JF_LIST_FIELDS = "MediaStreams,MediaSources,Overview,Genres,CommunityRating,OriginalTitle,ProviderIds,RunTimeTicks,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,PremiereDate"
+
+
+def is_jf_path(p):
+    p = str(p or "")
+    return p == JF_ROOT or p.startswith(JF_ROOT + "/")
+
+
+def jf_config():
+    cfg = config_store.load_config(CONFIG_PATH) or {}
+    return cfg.get("_jellyfin_") or {}
+
+
+def jf_save_config(base_url, username, token, user_id, device_id):
+    cfg = config_store.load_config(CONFIG_PATH) or {}
+    cfg["_jellyfin_"] = {"base_url": base_url, "username": username, "token": token,
+                         "user_id": user_id, "device_id": device_id}
+    config_store.save_config(CONFIG_PATH, cfg)
+    _remote_cache.pop("jellyfin", None)
+
+
+def jf_clear_config():
+    cfg = config_store.load_config(CONFIG_PATH) or {}
+    cfg.pop("_jellyfin_", None)
+    config_store.save_config(CONFIG_PATH, cfg)
+    _remote_cache.pop("jellyfin", None)
+    _jf_meta.clear()
+
+
+def get_jellyfin():
+    p = _remote_cache.get("jellyfin")
+    if p:
+        return p
+    c = jf_config()
+    if not (c.get("base_url") and c.get("token") and c.get("user_id")):
+        raise RuntimeError("还没连接 Jellyfin（在网页版里点「🎬 Jellyfin」填写账号）")
+    import remote_source
+    p = remote_source.JellyfinProvider(c["base_url"], c["token"], c["user_id"],
+                                       username=c.get("username", ""), device_id=c.get("device_id"))
+    _remote_cache["jellyfin"] = p
+    return p
+
+
+def jf_ids(path):
+    """'/jf/a/b/c.mkv' -> ['a','b','c']（去掉末段扩展名）。根返回 []。"""
+    segs = [s for s in str(path).split("/")[2:] if s]
+    if segs and "." in segs[-1]:
+        segs[-1] = segs[-1].rsplit(".", 1)[0]
+    for s in segs:
+        if not re.fullmatch(r"[0-9A-Za-z-]{8,64}", s):
+            raise ValueError("Jellyfin 路径不合法")
+    return segs
+
+
+def jf_item_id(path):
+    ids = jf_ids(path)
+    if not ids:
+        raise ValueError("Jellyfin 路径不合法")
+    return ids[-1]
+
+
+def _jf_remember(iid, meta):
+    if len(_jf_meta) >= _JF_META_MAX:
+        _jf_meta.pop(next(iter(_jf_meta)))
+    _jf_meta[iid] = meta
+
+
+def _jf_ext(raw):
+    c = str((raw.get("Container") or ((raw.get("MediaSources") or [{}])[0].get("Container")) or "mkv")).split(",")[0].strip().lower()
+    return ("." + c) if ("." + c) in VIDEO_EXTS else ".mkv"
+
+
+def _jf_subs(raw):
+    """内嵌 + 外挂的文字字幕流 -> [{index, name}]（图形字幕服务器也能转，但常常转不好，照列出来让用户试）。"""
+    out = []
+    for s in (raw.get("MediaStreams") or []):
+        if s.get("Type") != "Subtitle":
+            continue
+        title = s.get("DisplayTitle") or s.get("Title") or s.get("Language") or ("字幕 %s" % s.get("Index"))
+        out.append({"index": s.get("Index"), "name": str(title)[:80], "lang": s.get("Language") or ""})
+    return out
+
+
+def jf_list(path):
+    p = get_jellyfin()
+    ids = jf_ids(path or JF_ROOT)
+    parent_id = ids[-1] if ids else ""
+    base = JF_ROOT + "".join("/" + i for i in ids)
+    out = []
+    for src in p.list_dir_strict(parent_id, fields=_JF_LIST_FIELDS, raw=True):
+        raw = src.extra.get("raw") or {}
+        iid = src.extra["id"]
+        if src.is_dir:
+            out.append({"name": src.name, "path": base + "/" + iid, "rel": src.name, "kind": "dir",
+                        "size": None, "mtime": None})
+            _jf_remember(iid, {"type": raw.get("Type"), "name": src.name, "year": raw.get("ProductionYear"),
+                               "overview": raw.get("Overview"), "tag": src.extra.get("image_tag")})
+            continue
+        ext = _jf_ext(raw)
+        size = ((raw.get("MediaSources") or [{}])[0]).get("Size")
+        out.append({"name": src.name if src.name.lower().endswith(ext) else src.name + ext, "path": base + "/" + iid + ext,
+                    "rel": src.name, "kind": "video" if src.kind == "video" else (src.kind or "other"),
+                    "size": size, "mtime": None, "subs": _jf_subs(raw)})
+        _jf_remember(iid, {"type": raw.get("Type"), "name": src.name, "year": raw.get("ProductionYear"),
+                           "overview": raw.get("Overview"), "tag": src.extra.get("image_tag"),
+                           "series_id": raw.get("SeriesId"), "series_name": raw.get("SeriesName"),
+                           "season": raw.get("ParentIndexNumber"), "episode": raw.get("IndexNumber"),
+                           "rating": raw.get("CommunityRating"), "orig": raw.get("OriginalTitle"),
+                           "genres": raw.get("Genres") or [], "runtime": (raw.get("RunTimeTicks") or 0) // 600000000,
+                           "tmdb": (raw.get("ProviderIds") or {}).get("Tmdb")})
+    parent = (JF_ROOT + "/" + "/".join(ids[:-1])) if len(ids) > 1 else (JF_ROOT if ids else "")
+    return {"path": base, "parent": parent, "entries": out}
+
+
+def jf_open(path, headers=None):
+    """原始文件流（Static=true，支持 Range）。ffmpeg 转码 / AI 字幕读的也是这个，所以不需要服务器端转码。"""
+    p = get_jellyfin()
+    iid = jf_item_id(path)
+    import remote_types
+    src = remote_types.RemoteSource("jellyfin", iid, kind="video", extra={"id": iid})
+    src.extra["_stream_url"] = p.base_url + "/Videos/%s/stream?%s" % (
+        iid, urllib.parse.urlencode({"Static": "true", "MediaSourceId": iid}))
+    return p.open_stream(src, headers or {})
+
+
+def jf_meta(iid):
+    m = _jf_meta.get(iid)
+    if m is None:
+        p = get_jellyfin()
+        raw = p._get_json(p.base_url + "/Users/%s/Items/%s?%s" % (p.user_id, iid, urllib.parse.urlencode({"Fields": _JF_LIST_FIELDS})))
+        m = {"type": raw.get("Type"), "name": raw.get("Name"), "year": raw.get("ProductionYear"),
+             "overview": raw.get("Overview"), "tag": (raw.get("ImageTags") or {}).get("Primary"),
+             "series_id": raw.get("SeriesId"), "series_name": raw.get("SeriesName"),
+             "season": raw.get("ParentIndexNumber"), "episode": raw.get("IndexNumber"),
+             "rating": raw.get("CommunityRating"), "orig": raw.get("OriginalTitle"),
+             "genres": raw.get("Genres") or [], "runtime": (raw.get("RunTimeTicks") or 0) // 600000000,
+             "tmdb": (raw.get("ProviderIds") or {}).get("Tmdb")}
+        _jf_remember(iid, m)
+    return m
+
+
+def jf_peek(path):
+    """海报墙用：按 scrape.peek 的形状，直接给 Jellyfin 自己的标题 / 海报 / 季集信息（不联网问 TMDB）。"""
+    iid = jf_item_id(path)
+    m = jf_meta(iid)
+    ep = m.get("type") == "Episode" and m.get("series_id")
+    title = (m.get("series_name") if ep else m.get("name")) or m.get("name") or ""
+    parsed = {"kind": "episode" if ep else "movie", "title_candidates": [title], "year": m.get("year"),
+              "season": m.get("season") if ep else None, "episode": m.get("episode") if ep else None}
+    group = ("jf:series:" + m["series_id"]) if ep else None
+    poster_id = m["series_id"] if ep else iid
+    media = {"media_type": "tv" if ep else "movie", "tmdb_id": None, "title": title,
+             "title_zh": None, "title_en": m.get("orig") if m.get("orig") != title else None,
+             "year": str(m["year"]) if m.get("year") else "", "poster_path": "jf:" + poster_id,
+             "vote_average": m.get("rating") or 0, "number_of_seasons": None}
+    item = {"status": "matched", "source": "jellyfin", "score": 1, "pin_scope": None, "group_key": group, "media": media}
+    return {"key": remote_resume_key(path), "group_key": group, "parsed": parsed, "item": item}
+
+
+def jf_item_detail(path):
+    """海报墙详情面板用（/api/scrape/item）：Jellyfin 的简介 / 类型 / 时长。"""
+    iid = jf_item_id(path)
+    m = jf_meta(iid)
+    ep = m.get("type") == "Episode" and m.get("series_id")
+    sid = m["series_id"] if ep else iid
+    sm = jf_meta(sid) if ep else m
+    media = {"media_type": "tv" if ep else "movie", "tmdb_id": None,
+             "title": (m.get("series_name") if ep else m.get("name")) or "", "year": str(sm.get("year") or ""),
+             "poster_path": "jf:" + sid, "backdrop_path": None, "vote_average": sm.get("rating") or m.get("rating") or 0,
+             "overview_zh": sm.get("overview") or m.get("overview") or "", "overview_en": "",
+             "genres_zh": sm.get("genres") or m.get("genres") or [], "runtime": m.get("runtime") or 0,
+             "number_of_seasons": None}
+    return {"status": "matched", "source": "jellyfin", "score": 1, "pin_scope": None, "media": media}
+
+
+def jf_image(iid, size):
+    p = get_jellyfin()
+    w = {"w92": 92, "w154": 154, "w185": 185, "w342": 342, "w500": 500, "w780": 780}.get(size, 342)
+    if not re.fullmatch(r"[0-9A-Za-z-]{8,64}", iid or ""):
+        raise ValueError("id 不合法")
+    meta = _jf_meta.get(iid) or {}
+    params = {"maxWidth": str(w)}
+    if meta.get("tag"):
+        params["tag"] = meta["tag"]
+    req = urllib.request.Request(p.base_url + "/Items/%s/Images/Primary?%s" % (iid, urllib.parse.urlencode(params)),
+                                 headers=p._headers())
+    with netutil.urlopen(req, timeout=15) as r:
+        return r.read()
+
+
+def jf_subtitle(path, index):
+    """服务器把字幕（内嵌 / 外挂、文字 / 部分图形）转成 WebVTT。"""
+    p = get_jellyfin()
+    iid = jf_item_id(path)
+    idx = int(index)
+    if not 0 <= idx < 256:
+        raise ValueError("字幕序号不合法")
+    req = urllib.request.Request(p.base_url + "/Videos/%s/%s/Subtitles/%d/Stream.vtt" % (iid, iid, idx),
+                                 headers=p._headers())
+    with netutil.urlopen(req, timeout=60) as r:
+        return r.read(SUBTITLE_MAX_BYTES + 1)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1066,6 +1322,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._media_stream(q)
         if route == "/api/media/subtitle":
             return self._media_subtitle(q)
+        if route in ("/api/media/asr", "/api/media/asr/vtt"):
+            return self._media_asr(q, route.endswith("/vtt"))
         if route == "/api/videoresume":
             remote = (q.get("remote") or [""])[0]
             if remote:                                       # 云端视频：key 由后端按已配置的 WebDAV 地址算
@@ -1100,6 +1358,19 @@ class Handler(BaseHTTPRequestHandler):
             p = (q.get("path") or [""])[0]
             local = remote_local(p, q.get("mtime", [""])[0], q.get("size", [""])[0])
             return self._json({"ok": True, "path": local})
+        # ---------------- Jellyfin / Emby ----------------
+        if route == "/api/jellyfin/config":
+            c = jf_config()
+            return self._json({"ok": True, "connected": bool(c.get("token")), "base_url": c.get("base_url", ""),
+                               "username": c.get("username", "")})
+        if route == "/api/remote/jfsub":
+            p = (q.get("path") or [""])[0]
+            if not is_jf_path(p):
+                return self._err("不是 Jellyfin 路径")
+            data = jf_subtitle(p, (q.get("index") or ["-1"])[0])
+            if len(data) > SUBTITLE_MAX_BYTES:
+                return self._err("字幕文件太大（上限 %d MB）" % (SUBTITLE_MAX_BYTES >> 20), 413)
+            return self._bytes(data, "text/vtt; charset=utf-8", extra={"Cache-Control": "private, max-age=300"})
         return self._err("未知接口 %s" % route, 404)
 
     def _remote_data(self, q):
@@ -1383,6 +1654,49 @@ class Handler(BaseHTTPRequestHandler):
                 ffmpeg_tools.release_slot()
             src.close()
 
+    def _media_asr(self, q, want_vtt, start=False):
+        """AI 字幕（faster-whisper）：POST 启动 -> GET 查进度 -> GET /vtt 取 WebVTT（可带 start= 偏移对时）。"""
+        import asr_jobs
+        if not self._media_need_ffmpeg():
+            return
+        port = self.server.server_address[1]
+        lang = (q.get("lang") or ["ja"])[0] or "ja"
+        spec = self._media_spec(q)
+        try:
+            src = media_src(spec, port, ttl=60)
+        except (ValueError, PermissionError, FileNotFoundError, RuntimeError) as e:
+            return self._err("%s: %s" % (type(e).__name__, e), 400 if not isinstance(e, FileNotFoundError) else 404)
+        key = src.key
+        if src.kind == "local":
+            try:
+                st = os.stat(src.path)
+                key = "%s|%d|%d" % (key, st.st_mtime_ns, st.st_size)
+            except OSError:
+                pass
+        src.close()
+        cache_dir = os.path.join(os.path.dirname(CONFIG_PATH), "asr_cache")
+        try:
+            if want_vtt:
+                vtt = asr_jobs.read_vtt(cache_dir, key, lang)
+                if vtt is None:
+                    return self._err("还没有生成 AI 字幕", 404)
+                try:
+                    off = float((q.get("start") or ["0"])[0] or 0)
+                except ValueError:
+                    return self._err("start 不合法")
+                out = ffmpeg_tools.shift_vtt(vtt, off) if off > 0 else vtt
+                return self._bytes(out.encode("utf-8"), "text/vtt; charset=utf-8",
+                                   extra={"Cache-Control": "no-store"})   # 识别中拿到的是部分字幕，不能缓存
+            if start:
+                st = asr_jobs.start(cache_dir, key, lang, lambda: media_src(spec, port, ttl=6 * 3600))
+            else:
+                st = asr_jobs.status(cache_dir, key, lang)
+            return self._json({"ok": True, **st})
+        except ValueError as e:
+            return self._err(str(e), 400)
+        except RuntimeError as e:
+            return self._err(str(e), 501)
+
     # ---------------- 刮削接口 ----------------
     def _scrape_err(self, e):
         import scrape
@@ -1398,6 +1712,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, **sc.status()})
             if route == "/api/scrape/item":
                 src = {"path": (q.get("path") or [""])[0], "remote": (q.get("remote") or [""])[0]}
+                if is_jf_path(src["remote"]):
+                    return self._json({"ok": True, "item": {**jf_item_detail(src["remote"]), "key": scrape_key(src)}})
                 return self._json({"ok": True, "item": sc.item(scrape_key(src))})
             if route == "/api/scrape/search":
                 return self._json({"ok": True, "results": sc.search_manual(
@@ -1407,7 +1723,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": bool(j), "job": j}, 200 if j else 404)
             if route == "/api/scrape/image":
                 size = (q.get("size") or ["w342"])[0]
-                data = sc.image((q.get("p") or [""])[0], size)
+                pp = (q.get("p") or [""])[0]
+                if pp.startswith("jf:"):                       # Jellyfin 自己的海报（不经 TMDB）
+                    data = jf_image(pp[3:], size)
+                    ctype = "image/png" if data[:4] == bytes([0x89, 0x50, 0x4E, 0x47]) else "image/jpeg"
+                    return self._bytes(data, ctype, extra={"Cache-Control": "private, max-age=86400"})
+                data = sc.image(pp, size)
                 ctype = "image/png" if data[:4] == bytes([0x89, 0x50, 0x4E, 0x47]) else "image/jpeg"
                 return self._bytes(data, ctype, extra={"Cache-Control": "private, max-age=86400"})
         except scrape.TmdbError as e:
@@ -1434,18 +1755,28 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(items, list) or len(items) > 500:
                     return self._err("items 需为最多 500 个 {path|remote}")
                 out = []
+                all_jf = bool(items)
                 for i in items:
                     try:
                         k = scrape_key(i)
                     except Exception as e:
                         out.append({"error": "%s" % e})
                         continue
-                    orig = urllib.parse.unquote(str(i.get("remote") or "")) if i.get("remote") else str(i.get("path") or "")
-                    r = sc.peek(k, orig)
+                    if isinstance(i, dict) and is_jf_path(i.get("remote")):
+                        try:
+                            r = jf_peek(i["remote"])
+                        except Exception as e:
+                            out.append({"error": "%s" % e})
+                            continue
+                    else:
+                        all_jf = False
+                        orig = urllib.parse.unquote(str(i.get("remote") or "")) if i.get("remote") else str(i.get("path") or "")
+                        r = sc.peek(k, orig)
                     r["resume_ms"] = video_resume_get(key=k)
                     r["watched"] = video_watched_get(key=k)
                     out.append(r)
-                return self._json({"ok": True, "items": out, "token_configured": sc.client.has_token()})
+                # 全是 Jellyfin 条目时不需要 TMDB 令牌（用的是 Jellyfin 自己的元数据）
+                return self._json({"ok": True, "items": out, "token_configured": True if all_jf else sc.client.has_token()})
             if route == "/api/scrape/cancel":
                 sc.cancel_job(str(body.get("id") or ""))
                 return self._json({"ok": True})
@@ -1488,6 +1819,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._scrape_post(route)
             if route == "/api/media/probe":
                 return self._media_probe({}, self._read_json_body())
+            if route == "/api/media/asr":
+                body = self._read_json_body()
+                return self._media_asr({"path": [body.get("path") or ""], "remote": [body.get("remote") or ""],
+                                        "lang": [body.get("lang") or "ja"]}, False, start=True)
             if route == "/api/open-external":
                 if not self._is_loopback():
                     return self._err("只允许本机页面调用", 403)
@@ -1547,6 +1882,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "base_url": url, "root": p.root_path})
             if route == "/api/remote/disconnect":
                 remote_clear_config()
+                return self._json({"ok": True})
+            if route == "/api/jellyfin/config":
+                body = self._read_json_body()
+                url = str(body.get("base_url") or "").strip().rstrip("/")
+                if not url:
+                    return self._err("请填写 Jellyfin 地址（形如 http://192.168.1.20:8096）")
+                if "://" not in url:
+                    url = "http://" + url
+                if not re.match(r"^https?://", url, re.I):
+                    return self._err("地址只支持 http / https")
+                user = str(body.get("username") or "").strip()
+                pw = str(body.get("password") or "")
+                if not user:
+                    return self._err("请填写用户名")
+                import remote_source
+                token, user_id, device_id = remote_source.JellyfinProvider.authenticate(url, user, pw)
+                if not token or not user_id:
+                    return self._err("登录失败：服务器没有返回 token")
+                p = remote_source.JellyfinProvider(url, token, user_id, username=user, device_id=device_id)
+                p.list_dir_strict("")                       # 连通性自检：失败就抛出，不保存
+                jf_save_config(url, user, token, user_id, device_id)   # 只存 token，密码不落盘
+                return self._json({"ok": True, "base_url": url, "root": JF_ROOT})
+            if route == "/api/jellyfin/disconnect":
+                jf_clear_config()
                 return self._json({"ok": True})
             return self._err("未知接口 %s" % route, 404)
         except Exception as e:
